@@ -22,6 +22,33 @@
 
 Backup results are read from systemd's structured journal events, so the plugin never touches your backup credentials.
 
+## How it works
+
+The plugin is **backup-tool agnostic**. It knows nothing about restic, borg, rsync, or any specific tool — it only speaks *systemd*. Anything you can run as a systemd oneshot service works, and the journal is the single source of truth.
+
+```mermaid
+flowchart LR
+    B["Your backup tool<br/>restic · borg · rsync · custom"] --> S["systemd oneshot<br/>service"]
+    S -->|"start / success / fail<br/>lifecycle events"| J[("systemd journal")]
+    J -->|"journalctl -o json"| H["backup-history<br/>reads MESSAGE_IDs"]
+    H --> P["Omarchy bar panel<br/>health · last run · 4-week map"]
+    P -->|"Run backup now"| R["pkexec systemctl start"]
+    R --> S
+    P -->|"View logs"| L["journalctl -f<br/>in a terminal"]
+```
+
+Each day in the map is colored from the journal, not from the tool's output:
+
+```mermaid
+flowchart TD
+    Q{"Latest journal event<br/>for that day?"}
+    Q -->|"unit failed"| F["Red — failed"]
+    Q -->|"unit started / ran"| G["Green — successful"]
+    Q -->|"no event"| N["Grey — no backup"]
+```
+
+Because detection relies on systemd's own unit lifecycle, a run that exits non-zero is recorded as `failed` by systemd and shown in red — no per-tool parsing required.
+
 ## Install
 
 ```bash
