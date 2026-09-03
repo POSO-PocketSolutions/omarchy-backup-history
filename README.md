@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="preview.png" width="360" alt="Backup History panel in the Omarchy bar">
+  <img src="assets/demo.gif" width="380" alt="Backup History panel cycling through healthy, running, and completed states">
 </p>
 
 ## Features
