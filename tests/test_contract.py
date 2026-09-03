@@ -10,6 +10,9 @@ class PluginContractTest(unittest.TestCase):
     def test_plugin_files_exist(self):
         self.assertTrue((ROOT / "manifest.json").exists())
         self.assertTrue((ROOT / "BarWidget.qml").exists())
+        self.assertTrue((ROOT / "Panel.qml").exists())
+        self.assertTrue((ROOT / "assets" / "logo.png").exists())
+        self.assertTrue((ROOT / "scripts" / "run-backup").exists())
 
     @unittest.skipUnless((ROOT / "manifest.json").exists(), "manifest not implemented")
     def test_manifest_is_publishable_bar_widget(self):
@@ -20,6 +23,7 @@ class PluginContractTest(unittest.TestCase):
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertEqual(manifest["entryPoints"]["barWidget"], "BarWidget.qml")
         self.assertEqual(manifest["license"], "MIT")
+        self.assertEqual(manifest["barWidget"]["defaults"]["weeks"], 4)
 
 
 if __name__ == "__main__":

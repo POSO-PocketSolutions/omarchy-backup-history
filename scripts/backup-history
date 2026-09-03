@@ -92,6 +92,8 @@ def collect(service, weeks):
     events = parse_events(output.splitlines())
     days = build_calendar(events, weeks, today)
     latest = max(events.values(), key=lambda event: event["timestamp"]) if events else None
+    successful = [event for event in events.values() if event["status"] == "success"]
+    latest_success = max(successful, key=lambda event: event["timestamp"]) if successful else None
     return {
         "service": service,
         "state": service_state(service),
@@ -105,13 +107,16 @@ def collect(service, weeks):
             "status": latest["status"],
             "timestamp": latest["timestamp"].isoformat(),
         } if latest else None,
+        "latestSuccess": {
+            "timestamp": latest_success["timestamp"].isoformat(),
+        } if latest_success else None,
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--service", default="restic-backup.service")
-    parser.add_argument("--weeks", type=int, default=12)
+    parser.add_argument("--weeks", type=int, default=4)
     args = parser.parse_args()
     try:
         payload = collect(args.service, max(2, min(args.weeks, 26)))

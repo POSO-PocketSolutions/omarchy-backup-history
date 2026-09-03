@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+service=${1:-restic-backup.service}
+[[ $service =~ ^[A-Za-z0-9_.@:-]+\.service$ ]]
+exec pkexec systemctl start "$service"

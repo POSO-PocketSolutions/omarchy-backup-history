@@ -5,20 +5,20 @@
   "version": "0.1.0",
   "author": "Matías Sosa",
   "license": "MIT",
-  "description": "GitHub-style daily history for systemd backup services in the Omarchy bar.",
+  "description": "Backup status, actions, logs, and four-week history for systemd services.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "Backup History",
-    "description": "Shows successful, failed, and missing backup days as a compact calendar heatmap.",
+    "description": "Shows backup health in the bar and opens a panel with status, actions, logs, and daily history.",
     "category": "System",
     "allowMultiple": true,
     "defaultSection": "right",
     "defaults": {
       "service": "restic-backup.service",
-      "weeks": 12,
+      "weeks": 4,
       "refreshIntervalSec": 60,
       "successColor": "#3fb950"
     },
@@ -34,9 +34,9 @@
         "type": "integer",
         "label": "Weeks",
         "min": 2,
-        "max": 26,
+        "max": 12,
         "step": 1,
-        "defaultValue": 12
+        "defaultValue": 4
       },
       {
         "key": "refreshIntervalSec",
