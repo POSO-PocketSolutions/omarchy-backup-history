@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+service=${1:-restic-backup.service}
+exec setsid uwsm-app -- xdg-terminal-exec \
+  --app-id=io.github.mnsosa.backup-history.logs \
+  --title="Backup history" \
+  -e journalctl -u "$service" -n 100 -f

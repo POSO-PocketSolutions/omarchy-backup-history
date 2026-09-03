@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mnsosa.backup-history",
+  "name": "Backup History",
+  "version": "0.1.0",
+  "author": "Matías Sosa",
+  "license": "MIT",
+  "description": "GitHub-style daily history for systemd backup services in the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Backup History",
+    "description": "Shows successful, failed, and missing backup days as a compact calendar heatmap.",
+    "category": "System",
+    "allowMultiple": true,
+    "defaultSection": "right",
+    "defaults": {
+      "service": "restic-backup.service",
+      "weeks": 12,
+      "refreshIntervalSec": 60,
+      "successColor": "#3fb950"
+    },
+    "schema": [
+      {
+        "key": "service",
+        "type": "string",
+        "label": "Systemd service",
+        "defaultValue": "restic-backup.service"
+      },
+      {
+        "key": "weeks",
+        "type": "integer",
+        "label": "Weeks",
+        "min": 2,
+        "max": 26,
+        "step": 1,
+        "defaultValue": 12
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 60
+      },
+      {
+        "key": "successColor",
+        "type": "string",
+        "label": "Success color",
+        "defaultValue": "#3fb950"
+      }
+    ]
+  }
+}
