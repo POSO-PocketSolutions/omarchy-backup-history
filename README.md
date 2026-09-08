@@ -10,6 +10,8 @@
 
 <p align="center">
   <img src="assets/demo.gif" width="380" alt="Backup History panel cycling through healthy, running, and completed states">
+  <br>
+  <sub>Representative demo history.</sub>
 </p>
 
 ## Features
@@ -49,6 +51,16 @@ flowchart TD
 
 Because detection relies on systemd's own unit lifecycle, a run that exits non-zero is recorded as `failed` by systemd and shown in red — no per-tool parsing required.
 
+## Requirements
+
+- Omarchy with shell plugin support.
+- A backup job managed by a systemd service; a oneshot service is recommended.
+- Permission to read that service's journal with `journalctl`.
+- `polkit`/`pkexec` for **Run backup now**. The plugin requests authorization to start only the configured service and does not install sudoers rules.
+- `uwsm-app` and `xdg-terminal-exec` for **View logs**; both are part of the standard Omarchy desktop environment.
+
+No particular backup engine is required. Restic is only the default example; borg, rsync, or a custom script work the same way when wrapped in a systemd service.
+
 ## Install
 
 ```bash
@@ -70,6 +82,14 @@ omarchy bar set io.github.mnsosa.backup-history successColor '"#3fb950"' --json
 ```
 
 The service must be managed by systemd, and its journal must be readable by the desktop user.
+
+## Remove
+
+```bash
+omarchy plugin remove io.github.mnsosa.backup-history --yes
+```
+
+Removal deletes the installed plugin checkout. It does not modify or remove your backup service, journal, credentials, or backup data.
 
 ## Development
 
