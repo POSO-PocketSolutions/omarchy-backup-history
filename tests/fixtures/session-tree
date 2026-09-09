@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+SESSION_TOKEN_ENV = "BACKUP_HISTORY_SESSION_TOKEN"
+
+
+def write_identity(path):
+    Path(path).write_text(json.dumps([os.getpid(), os.getpgid(0), os.getsid(0)]))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--directory", required=True)
+    parser.add_argument("--session-token", required=True)
+    args = parser.parse_args()
+
+    os.environ[SESSION_TOKEN_ENV] = args.session_token
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    directory = Path(args.directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    leader_file = directory / "leader.json"
+    command_file = directory / "command.json"
+    grandchild_file = directory / "grandchild.json"
+    write_identity(leader_file)
+
+    grandchild_code = (
+        "import json,os,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        f"open({str(grandchild_file)!r},'w').write(json.dumps([os.getpid(),os.getpgid(0),os.getsid(0)]));"
+        "time.sleep(60)"
+    )
+    command_code = (
+        "import json,os,signal,subprocess,sys,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        f"open({str(command_file)!r},'w').write(json.dumps([os.getpid(),os.getpgid(0),os.getsid(0)]));"
+        f"subprocess.Popen([sys.executable,'-c',{grandchild_code!r}],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        f"p={str(grandchild_file)!r};deadline=time.monotonic()+2;"
+        "\nwhile not os.path.exists(p) and time.monotonic()<deadline: time.sleep(0.01)\n"
+        "time.sleep(60)"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", command_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        process_group=0,
+    )
+
+    deadline = time.monotonic() + 2
+    while not grandchild_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not grandchild_file.exists():
+        return 1
+    print("READY", flush=True)
+    time.sleep(60)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

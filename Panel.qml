@@ -3,6 +3,7 @@ import QtQuick.Effects
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "HistoryLifecycle.js" as HistoryLifecycle
 
 Panel {
   id: root
@@ -17,6 +18,18 @@ Panel {
   property var latestSuccess: null
   property string state: "loading"
   property string error: ""
+  property var historyCollector: null
+  property string historyRaw: ""
+  property bool historyStreamFinished: false
+  property bool historyProcessExited: false
+  property bool historyAborted: false
+  property bool historyTearingDown: false
+  property int historyProcessId: 0
+  property string historySessionToken: ""
+
+  readonly property int historyJsonLimit: 64 * 1024
+  readonly property int historyCollectorLimit: 96 * 1024
+  readonly property int historyWatchdogMs: 10000
 
   readonly property var barIdentity: hostWidget || root
   readonly property string service: String(setting("service", "restic-backup.service"))
@@ -29,6 +42,7 @@ Panel {
   readonly property color missingColor: Util.alpha(foregroundColor, 0.12)
   readonly property color runningColor: Color.accent
   readonly property string backendPath: pathFor("scripts/backup-history")
+  readonly property string sessionTerminatorPath: pathFor("scripts/terminate-history-session")
   readonly property string runPath: pathFor("scripts/run-backup")
   readonly property string logsPath: pathFor("scripts/open-logs")
   readonly property string shortStatus: {
@@ -76,23 +90,153 @@ Panel {
     return missingColor
   }
 
+  function setHistoryError(message) {
+    days = []
+    summary = ({ "success": 0, "failed": 0, "missing": 0 })
+    latest = null
+    latestSuccess = null
+    state = "unknown"
+    error = String(message).slice(0, 256)
+  }
+
+  function releaseHistoryCollector() {
+    var collector = historyCollector
+    historyCollector = null
+    historyProc.stdout = null
+    if (collector) Qt.callLater(function() { collector.destroy() })
+  }
+
+  function createHistorySessionToken() {
+    var parts = [Date.now().toString(16)]
+    for (var index = 0; index < 4; index++)
+      parts.push(Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0"))
+    return parts.join("-")
+  }
+
+  function captureHistoryProcessId() {
+    var processId = Number(historyProc.processId)
+    if (Number.isFinite(processId) && processId > 1)
+      historyProcessId = Math.floor(processId)
+  }
+
+  function launchHistorySessionCleanup() {
+    captureHistoryProcessId()
+    if (historyProcessId <= 1 || historySessionToken === "") return
+    historySessionTerminator.command = [
+      sessionTerminatorPath,
+      "--sid", String(historyProcessId),
+      "--token", historySessionToken
+    ]
+    historySessionTerminator.startDetached()
+  }
+
+  function startHistory() {
+    if (historyProc.running || historyTearingDown) return
+
+    releaseHistoryCollector()
+    historyProcessId = 0
+    historySessionToken = createHistorySessionToken()
+    historyRaw = ""
+    historyStreamFinished = false
+    historyProcessExited = false
+    historyAborted = false
+
+    var collector = historyCollectorFactory.createObject(root)
+    if (!collector) {
+      setHistoryError("Unable to create bounded output collector")
+      return
+    }
+    historyCollector = collector
+    historyProc.stdout = collector
+    historyWatchdog.restart()
+    historyProc.running = true
+  }
+
   function refresh() {
-    if (!historyProc.running) historyProc.running = true
+    startHistory()
+  }
+
+  function abortHistory(message) {
+    if (historyAborted || historyTearingDown) return
+    historyAborted = true
+    historyWatchdog.stop()
+    setHistoryError(message)
+    releaseHistoryCollector()
+
+    if (historyProc.running) {
+      launchHistorySessionCleanup()
+      historyProc.signal(15)
+    }
+  }
+
+  function handleHistoryData(collector) {
+    if (collector !== historyCollector || historyAborted || historyTearingDown) return
+    if (collector.data.byteLength > historyCollectorLimit)
+      abortHistory("Backend output exceeded QML collector limit")
+  }
+
+  function handleHistoryStreamFinished(collector) {
+    if (collector !== historyCollector || historyAborted || historyTearingDown) return
+    if (collector.data.byteLength > historyJsonLimit) {
+      abortHistory("Backend JSON exceeded size limit")
+      return
+    }
+    historyRaw = collector.text
+    historyStreamFinished = true
+    finishHistoryIfReady()
+  }
+
+  function handleHistoryExited(exitCode) {
+    historyProcessExited = true
+    if (exitCode !== 0 && !historyAborted && !historyTearingDown)
+      launchHistorySessionCleanup()
+    historyProcessId = 0
+    if (historyAborted || historyTearingDown) {
+      historyWatchdog.stop()
+      releaseHistoryCollector()
+      return
+    }
+    if (exitCode !== 0) {
+      historyWatchdog.stop()
+      setHistoryError("Backup history backend exited with status " + exitCode)
+      releaseHistoryCollector()
+      return
+    }
+    finishHistoryIfReady()
+  }
+
+  function finishHistoryIfReady() {
+    if (!HistoryLifecycle.shouldFinish(
+      historyStreamFinished,
+      historyProcessExited,
+      historyAborted,
+      historyTearingDown
+    )) return
+    historyWatchdog.stop()
+    update(historyRaw)
+    historyRaw = ""
+    releaseHistoryCollector()
   }
 
   function update(raw) {
     try {
+      if (raw.length > historyJsonLimit) throw new Error("Backend JSON exceeded size limit")
       var payload = JSON.parse(raw)
-      days = payload.days || []
+      if (!Array.isArray(payload.days) || payload.days.length > weeks * 7)
+        throw new Error("Invalid days payload")
+      for (var index = 0; index < payload.days.length; index++) {
+        var status = payload.days[index].status
+        if (status !== "success" && status !== "failed" && status !== "none")
+          throw new Error("Invalid day status")
+      }
+      days = payload.days
       summary = payload.summary || ({ "success": 0, "failed": 0, "missing": 0 })
       latest = payload.latest || null
       latestSuccess = payload.latestSuccess || null
       state = payload.state || "unknown"
-      error = payload.error || ""
+      error = String(payload.error || "").slice(0, 256)
     } catch (exception) {
-      days = []
-      state = "unknown"
-      error = String(exception)
+      setHistoryError(exception)
     }
   }
 
@@ -114,13 +258,33 @@ Panel {
     if (bar) bar.run(logsPath + " " + Util.shellQuote(service))
   }
 
+  Component {
+    id: historyCollectorFactory
+
+    StdioCollector {
+      id: collector
+      waitForEnd: false
+      onDataChanged: root.handleHistoryData(collector)
+      onStreamFinished: root.handleHistoryStreamFinished(collector)
+    }
+  }
+
   Process {
     id: historyProc
-    command: [root.backendPath, "--service", root.service, "--weeks", String(root.weeks)]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.update(text)
-    }
+    command: [
+      root.backendPath,
+      "--service", root.service,
+      "--weeks", String(root.weeks),
+      "--session-token", root.historySessionToken
+    ]
+    stdout: null
+    onStarted: root.captureHistoryProcessId()
+    onExited: function(exitCode, exitStatus) { root.handleHistoryExited(exitCode) }
+  }
+
+  Process {
+    id: historySessionTerminator
+    command: []
   }
 
   Process {
@@ -130,11 +294,30 @@ Panel {
   }
 
   Timer {
+    id: historyWatchdog
+    interval: root.historyWatchdogMs
+    repeat: false
+    onTriggered: root.abortHistory("Backup history backend exceeded QML watchdog")
+  }
+
+  Timer {
     interval: root.refreshInterval
     running: true
     repeat: true
     triggeredOnStart: true
     onTriggered: root.refresh()
+  }
+
+  Component.onDestruction: {
+    historyTearingDown = true
+    historyWatchdog.stop()
+    if (historyProc.running) {
+      // The detached session terminator owns TERM-to-KILL escalation and
+      // survives this component. Direct TERM only accelerates graceful exit.
+      launchHistorySessionCleanup()
+      historyProc.signal(15)
+    }
+    releaseHistoryCollector()
   }
 
   KeyboardPanel {

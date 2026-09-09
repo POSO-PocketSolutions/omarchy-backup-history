@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import signal
+import sys
+import time
+from dataclasses import dataclass
+
+
+TERM_GRACE_SECONDS = 0.75
+KILL_GRACE_SECONDS = 0.75
+POLL_SECONDS = 0.025
+MIN_SAFE_SESSION_ID = 2
+SESSION_TOKEN_ENV = b"BACKUP_HISTORY_SESSION_TOKEN="
+SESSION_TOKEN_PATTERN = re.compile(r"^[a-f0-9-]{16,128}$")
+
+
+class SessionIdentityMismatch(RuntimeError):
+    pass
+
+
+@dataclass
+class ProcessReference:
+    pid: int
+    pidfd: int
+    token_matches: bool
+
+    def close(self):
+        try:
+            os.close(self.pidfd)
+        except OSError:
+            pass
+
+
+def parse_session_id(value):
+    try:
+        session_id = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("session ID must be an integer") from error
+    if session_id < MIN_SAFE_SESSION_ID:
+        raise argparse.ArgumentTypeError("refusing unsafe session ID")
+    return session_id
+
+
+def parse_session_token(value):
+    if not SESSION_TOKEN_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("invalid session cleanup token")
+    return value
+
+
+def read_process_identity(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as process_stat:
+            fields = process_stat.read().rpartition(")")[2].split()
+        return fields[0], int(fields[3]), int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def process_has_token(pid, token):
+    encoded = token.encode("ascii")
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as process_environment:
+            environment = process_environment.read().split(b"\0")
+        if SESSION_TOKEN_ENV + encoded in environment:
+            return True
+    except OSError:
+        pass
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as process_command_line:
+            arguments = process_command_line.read().split(b"\0")
+    except OSError:
+        return False
+    for index, argument in enumerate(arguments[:-1]):
+        if argument == b"--session-token" and arguments[index + 1] == encoded:
+            return True
+    return False
+
+
+def snapshot_process(pid, session_id, token):
+    first_identity = read_process_identity(pid)
+    if first_identity is None or first_identity[0] == "Z" or first_identity[1] != session_id:
+        return None
+
+    try:
+        pidfd = os.pidfd_open(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return None
+
+    second_identity = read_process_identity(pid)
+    if second_identity != first_identity:
+        os.close(pidfd)
+        return None
+
+    token_matches = process_has_token(pid, token)
+    if read_process_identity(pid) != first_identity:
+        os.close(pidfd)
+        return None
+    return ProcessReference(pid=pid, pidfd=pidfd, token_matches=token_matches)
+
+
+def close_references(references):
+    for reference in references:
+        reference.close()
+
+
+def session_snapshot(session_id, token):
+    own_pid = os.getpid()
+    references = []
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return references
+
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == own_pid:
+                continue
+            reference = snapshot_process(pid, session_id, token)
+            if reference is not None:
+                references.append(reference)
+    return references
+
+
+def authenticated_snapshot(session_id, token):
+    references = session_snapshot(session_id, token)
+    if references and not any(reference.token_matches for reference in references):
+        close_references(references)
+        raise SessionIdentityMismatch("session identity token did not match")
+    return references
+
+
+def signal_references(references, signum):
+    permission_denied = False
+    for reference in references:
+        try:
+            signal.pidfd_send_signal(reference.pidfd, signum)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            permission_denied = True
+    return permission_denied
+
+
+def signal_authenticated_session(session_id, token, signum):
+    references = authenticated_snapshot(session_id, token)
+    if not references:
+        return False, False
+    try:
+        permission_denied = signal_references(references, signum)
+    finally:
+        close_references(references)
+    return True, permission_denied
+
+
+def session_is_empty(session_id, token):
+    references = authenticated_snapshot(session_id, token)
+    try:
+        return not references
+    finally:
+        close_references(references)
+
+
+def terminate_session(session_id, token):
+    if os.getsid(0) == session_id:
+        raise ValueError("refusing to terminate own session")
+
+    permission_denied = False
+    term_deadline = time.monotonic() + TERM_GRACE_SECONDS
+    while time.monotonic() < term_deadline:
+        found, denied = signal_authenticated_session(session_id, token, signal.SIGTERM)
+        permission_denied |= denied
+        if not found:
+            return not permission_denied
+        time.sleep(POLL_SECONDS)
+
+    kill_deadline = time.monotonic() + KILL_GRACE_SECONDS
+    while time.monotonic() < kill_deadline:
+        found, denied = signal_authenticated_session(session_id, token, signal.SIGKILL)
+        permission_denied |= denied
+        if not found:
+            return not permission_denied
+        time.sleep(POLL_SECONDS)
+
+    return not permission_denied and session_is_empty(session_id, token)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Terminate every process still belonging to one authenticated Backup History session."
+    )
+    parser.add_argument("--sid", required=True, type=parse_session_id)
+    parser.add_argument("--token", required=True, type=parse_session_token)
+    args = parser.parse_args()
+
+    try:
+        terminated = terminate_session(args.sid, args.token)
+    except (OSError, SessionIdentityMismatch, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if not terminated:
+        print("session cleanup incomplete", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

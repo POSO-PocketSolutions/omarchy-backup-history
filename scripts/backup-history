@@ -1,17 +1,303 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
 import json
+import os
+import re
+import selectors
+import signal
 import subprocess
+import time
 from datetime import date, datetime, timedelta, timezone
 
 
 SUCCESS_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 FAILURE_MESSAGE_ID = "be02cf6855d2428ba40df7e9d022f03d"
 
+MAX_WEEKS = 12
+MAX_DAYS = MAX_WEEKS * 7
+MAX_SERVICE_LENGTH = 255
+SERVICE_PATTERN = re.compile(r"^[A-Za-z0-9_.@:-]+\.service$")
+SESSION_TOKEN_PATTERN = re.compile(r"^[a-f0-9-]{16,128}$")
+SESSION_TOKEN_ENV = "BACKUP_HISTORY_SESSION_TOKEN"
+JOURNAL_MAX_RECORDS = 4096
+JOURNAL_MAX_BYTES = 1024 * 1024
+SYSTEMCTL_MAX_BYTES = 16 * 1024
+STDERR_MAX_BYTES = 8 * 1024
+JSON_MAX_BYTES = 64 * 1024
+ERROR_MAX_CHARS = 256
+JOURNAL_TIMEOUT_SECONDS = 5.0
+SYSTEMCTL_TIMEOUT_SECONDS = 2.0
+TERM_GRACE_SECONDS = 0.5
+POST_KILL_WAIT_SECONDS = 0.5
+READ_CHUNK_BYTES = 64 * 1024
 
-def run(*args):
-    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+PR_SET_PDEATHSIG = 1
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_ACTIVE_PROCESS = None
+_SIGNALS_BLOCKED_DURING_SPAWN = {signal.SIGTERM, signal.SIGINT}
+
+
+class BoundedProcessError(RuntimeError):
+    """An external command exceeded its bounds or exited unsuccessfully."""
+
+
+class ProcessDeadlineExceeded(BoundedProcessError):
+    pass
+
+
+class ProcessOutputLimitExceeded(BoundedProcessError):
+    pass
+
+
+class ProcessRecordLimitExceeded(BoundedProcessError):
+    pass
+
+
+def _prepare_child(expected_parent, parent_signal_mask):
+    if _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        os._exit(127)
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signal.SIGKILL)
+    signal.pthread_sigmask(signal.SIG_SETMASK, parent_signal_mask)
+
+
+def establish_backend_session():
+    """Make this process the leader of the session QML will clean up by PID."""
+    process_id = os.getpid()
+    if os.getsid(0) != process_id:
+        os.setsid()
+    if os.getsid(0) != process_id:
+        raise OSError("unable to establish isolated backend session")
+
+
+def _process_state(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as process_stat:
+            fields = process_stat.read().rpartition(")")[2].split()
+    except (OSError, IndexError):
+        return None
+    return fields[0] if fields else None
+
+
+def _process_group_has_live_members(process_group_id):
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return True
+
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                if os.getpgid(pid) == process_group_id and _process_state(pid) != "Z":
+                    return True
+            except (ProcessLookupError, PermissionError):
+                continue
+    return False
+
+
+def terminate_process_group(
+    process,
+    grace_seconds=TERM_GRACE_SECONDS,
+    post_kill_wait_seconds=POST_KILL_WAIT_SECONDS,
+):
+    """Terminate a command group while its unreaped leader pins the PGID."""
+    if process.returncode is not None:
+        return True
+
+    process_group_id = process.pid
+    if _process_group_has_live_members(process_group_id):
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        deadline = time.monotonic() + grace_seconds
+        while _process_group_has_live_members(process_group_id) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        if _process_group_has_live_members(process_group_id):
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        kill_deadline = time.monotonic() + post_kill_wait_seconds
+        while _process_group_has_live_members(process_group_id) and time.monotonic() < kill_deadline:
+            time.sleep(0.01)
+
+    group_stopped = not _process_group_has_live_members(process_group_id)
+    try:
+        process.wait(timeout=post_kill_wait_seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return group_stopped
+
+
+def _wait_without_reaping(process, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        result = os.waitid(os.P_PID, process.pid, flags)
+        if result is not None:
+            if result.si_code == os.CLD_EXITED:
+                return result.si_status
+            if result.si_code in {os.CLD_KILLED, os.CLD_DUMPED}:
+                return -result.si_status
+            raise BoundedProcessError("external command returned an unsupported wait status")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+        time.sleep(min(0.01, remaining))
+
+
+def _signal_handler(signum, _frame):
+    process = _ACTIVE_PROCESS
+    if process is not None:
+        terminate_process_group(process)
+    raise SystemExit(128 + signum)
+
+
+def install_signal_handlers():
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+
+def _close_stream(selector, stream):
+    if stream is None:
+        return
+    try:
+        selector.unregister(stream)
+    except (KeyError, ValueError):
+        pass
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _bounded_error_text(value):
+    text = " ".join(str(value).splitlines()).strip()
+    return text[:ERROR_MAX_CHARS] or "external command failed"
+
+
+def bounded_run(
+    *args,
+    timeout_seconds,
+    max_stdout_bytes,
+    max_stderr_bytes=STDERR_MAX_BYTES,
+    max_records=None,
+):
+    """Run a command with bounded pipes, deadline, group teardown, and reaping."""
+    global _ACTIVE_PROCESS
+
+    expected_parent = os.getpid()
+    previous_signal_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        _SIGNALS_BLOCKED_DURING_SPAWN,
+    )
+    process = None
+    try:
+        process = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            process_group=0,
+            preexec_fn=lambda: _prepare_child(expected_parent, previous_signal_mask),
+        )
+        _ACTIVE_PROCESS = process
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_records = 0
+    deadline = time.monotonic() + timeout_seconds
+
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProcessDeadlineExceeded(
+                    f"{os.path.basename(args[0])} exceeded {timeout_seconds:g}s deadline"
+                )
+
+            events = selector.select(timeout=min(0.1, remaining))
+            if not events:
+                continue
+
+            for key, _mask in events:
+                chunk = os.read(key.fd, READ_CHUNK_BYTES)
+                if not chunk:
+                    _close_stream(selector, key.fileobj)
+                    continue
+
+                if key.data == "stdout":
+                    if len(stdout) + len(chunk) > max_stdout_bytes:
+                        raise ProcessOutputLimitExceeded(
+                            f"{os.path.basename(args[0])} exceeded {max_stdout_bytes} stdout bytes"
+                        )
+                    stdout_records += chunk.count(b"\n")
+                    if max_records is not None and stdout_records > max_records:
+                        raise ProcessRecordLimitExceeded(
+                            f"{os.path.basename(args[0])} exceeded {max_records} records"
+                        )
+                    stdout.extend(chunk)
+                else:
+                    if len(stderr) + len(chunk) > max_stderr_bytes:
+                        raise ProcessOutputLimitExceeded(
+                            f"{os.path.basename(args[0])} exceeded {max_stderr_bytes} stderr bytes"
+                        )
+                    stderr.extend(chunk)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProcessDeadlineExceeded(
+                f"{os.path.basename(args[0])} exceeded {timeout_seconds:g}s deadline"
+            )
+        try:
+            return_code = _wait_without_reaping(process, remaining)
+        except subprocess.TimeoutExpired as error:
+            raise ProcessDeadlineExceeded(
+                f"{os.path.basename(args[0])} exceeded {timeout_seconds:g}s deadline"
+            ) from error
+
+        if return_code != 0:
+            detail = _bounded_error_text(stderr.decode("utf-8", errors="replace"))
+            raise BoundedProcessError(
+                f"{os.path.basename(args[0])} exited with status {return_code}: {detail}"
+            )
+        return stdout.decode("utf-8", errors="strict")
+    except BaseException:
+        terminate_process_group(process)
+        raise
+    finally:
+        _close_stream(selector, process.stdout)
+        _close_stream(selector, process.stderr)
+        selector.close()
+        terminate_process_group(process)
+        _ACTIVE_PROCESS = None
+
+
+def validate_session_token(token):
+    if token and not SESSION_TOKEN_PATTERN.fullmatch(token):
+        raise ValueError("invalid session cleanup token")
+    return token
+
+
+def validate_service(service):
+    if len(service) > MAX_SERVICE_LENGTH or not SERVICE_PATTERN.fullmatch(service):
+        raise ValueError("invalid systemd service name")
+    return service
 
 
 def parse_events(lines, local_timezone=None):
@@ -55,7 +341,7 @@ def build_calendar(events, weeks, today=None):
 
 
 def service_state(service):
-    output = run(
+    output = bounded_run(
         "systemctl",
         "show",
         service,
@@ -65,6 +351,8 @@ def service_state(service):
         "SubState",
         "-p",
         "Result",
+        timeout_seconds=SYSTEMCTL_TIMEOUT_SECONDS,
+        max_stdout_bytes=SYSTEMCTL_MAX_BYTES,
     )
     properties = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     active = properties.get("ActiveState", "unknown")
@@ -77,17 +365,25 @@ def service_state(service):
 
 
 def collect(service, weeks):
+    service = validate_service(service)
     today = date.today()
     start = today - timedelta(days=weeks * 7)
-    output = run(
+    output = bounded_run(
         "journalctl",
         "-u",
         service,
         "--since",
         start.isoformat(),
-        "-o",
-        "json",
+        "--output=json",
+        "--output-fields=MESSAGE_ID,__REALTIME_TIMESTAMP",
+        "--lines",
+        str(JOURNAL_MAX_RECORDS + 1),
         "--no-pager",
+        f"MESSAGE_ID={SUCCESS_MESSAGE_ID}",
+        f"MESSAGE_ID={FAILURE_MESSAGE_ID}",
+        timeout_seconds=JOURNAL_TIMEOUT_SECONDS,
+        max_stdout_bytes=JOURNAL_MAX_BYTES,
+        max_records=JOURNAL_MAX_RECORDS,
     )
     events = parse_events(output.splitlines())
     days = build_calendar(events, weeks, today)
@@ -113,16 +409,54 @@ def collect(service, weeks):
     }
 
 
+def encode_payload(payload):
+    if "error" in payload:
+        payload = dict(payload)
+        payload["error"] = _bounded_error_text(payload["error"])
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    if len(encoded) <= JSON_MAX_BYTES:
+        return encoded.decode("ascii")
+
+    fallback = {
+        "service": str(payload.get("service", ""))[:MAX_SERVICE_LENGTH],
+        "state": "unknown",
+        "days": [],
+        "error": "backend JSON payload exceeded size limit",
+    }
+    return json.dumps(fallback, ensure_ascii=True, separators=(",", ":"))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--service", default="restic-backup.service")
     parser.add_argument("--weeks", type=int, default=4)
+    parser.add_argument("--session-token", default="")
     args = parser.parse_args()
+    service = str(args.service)[:MAX_SERVICE_LENGTH]
+
+    install_signal_handlers()
     try:
-        payload = collect(args.service, max(2, min(args.weeks, 26)))
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, json.JSONDecodeError) as error:
-        payload = {"service": args.service, "state": "unknown", "days": [], "error": str(error)}
-    print(json.dumps(payload, separators=(",", ":")))
+        session_token = validate_session_token(args.session_token)
+        if session_token:
+            os.environ[SESSION_TOKEN_ENV] = session_token
+        establish_backend_session()
+        service = validate_service(args.service)
+        payload = collect(service, max(2, min(args.weeks, MAX_WEEKS)))
+    except (
+        BoundedProcessError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        KeyError,
+        json.JSONDecodeError,
+    ) as error:
+        payload = {
+            "service": service,
+            "state": "unknown",
+            "days": [],
+            "error": _bounded_error_text(error),
+        }
+    print(encode_payload(payload))
 
 
 if __name__ == "__main__":
