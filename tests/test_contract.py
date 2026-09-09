@@ -27,6 +27,16 @@ class PluginContractTest(unittest.TestCase):
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(manifest["barWidget"]["defaults"]["weeks"], 4)
 
+    def test_privileged_backup_command_uses_fixed_trusted_paths(self):
+        run_backup = (ROOT / "scripts" / "run-backup").read_text()
+
+        self.assertIn(
+            'exec /usr/bin/pkexec /usr/bin/systemctl start -- "$service"',
+            run_backup,
+        )
+        self.assertNotIn("exec pkexec", run_backup)
+        self.assertIn("^[A-Za-z0-9_.@:-]+\\.service$", run_backup)
+
     def test_process_safety_contract(self):
         backend = (ROOT / "scripts" / "backup-history").read_text()
         terminator = (ROOT / "scripts" / "terminate-history-session").read_text()

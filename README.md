@@ -34,7 +34,7 @@ flowchart LR
     S -->|"start / success / fail<br/>lifecycle events"| J[("systemd journal")]
     J -->|"journalctl -o json"| H["backup-history<br/>reads MESSAGE_IDs"]
     H --> P["Omarchy bar panel<br/>health · last run · 4-week map"]
-    P -->|"Run backup now"| R["pkexec systemctl start"]
+    P -->|"Run backup now"| R["/usr/bin/pkexec<br/>/usr/bin/systemctl start --"]
     R --> S
     P -->|"View logs"| L["journalctl -f<br/>in a terminal"]
 ```

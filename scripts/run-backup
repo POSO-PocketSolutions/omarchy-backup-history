@@ -3,4 +3,4 @@ set -euo pipefail
 
 service=${1:-restic-backup.service}
 [[ $service =~ ^[A-Za-z0-9_.@:-]+\.service$ ]]
-exec pkexec systemctl start "$service"
+exec /usr/bin/pkexec /usr/bin/systemctl start -- "$service"
