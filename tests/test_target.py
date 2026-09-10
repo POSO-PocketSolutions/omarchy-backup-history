@@ -56,5 +56,53 @@ class ParseTargetEnvTest(unittest.TestCase):
         self.assertEqual(parsed, {"uuid": "", "path": "", "label": ""})
 
 
+class ResolveTargetTest(unittest.TestCase):
+    def setUp(self):
+        self.backend = load_backend()
+
+    def test_mounted_when_uuid_is_present_in_disks(self):
+        disks = [{
+            "uuid": "1f0e5a3c", "label": "backup", "size": "1.8T",
+            "fstype": "ext4", "mountpoint": "/run/media/user/backup",
+            "removable": True,
+        }]
+        target = self.backend.resolve_target(
+            {"uuid": "1f0e5a3c", "path": "/stale/path", "label": "backup"},
+            disks,
+            True,
+        )
+        self.assertTrue(target["mounted"])
+        self.assertEqual(target["path"], "/run/media/user/backup")
+        self.assertTrue(target["dropInInstalled"])
+
+    def test_unmounted_when_uuid_is_absent(self):
+        target = self.backend.resolve_target(
+            {"uuid": "1f0e5a3c", "path": "/run/media/user/backup", "label": "backup"},
+            [],
+            True,
+        )
+        self.assertFalse(target["mounted"])
+        self.assertIsNone(target["freeBytes"])
+
+    def test_known_uuid_without_mountpoint_is_not_mounted(self):
+        disks = [{
+            "uuid": "1f0e5a3c", "label": "backup", "size": "1.8T",
+            "fstype": "ext4", "mountpoint": "", "removable": True,
+        }]
+        target = self.backend.resolve_target(
+            {"uuid": "1f0e5a3c", "path": "", "label": "backup"}, disks, False
+        )
+        self.assertFalse(target["mounted"])
+        self.assertFalse(target["dropInInstalled"])
+
+    def test_unconfigured_target_is_reported_empty(self):
+        target = self.backend.resolve_target(
+            {"uuid": "", "path": "", "label": ""}, [], False
+        )
+        self.assertEqual(target["uuid"], "")
+        self.assertFalse(target["mounted"])
+        self.assertFalse(target["dropInInstalled"])
+
+
 if __name__ == "__main__":
     unittest.main()

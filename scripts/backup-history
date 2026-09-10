@@ -447,6 +447,58 @@ def discover_services(configured=""):
     return parse_services(output, configured)
 
 
+def resolve_target(target, disks, drop_in_installed):
+    resolved = {
+        "uuid": target.get("uuid", ""),
+        "path": target.get("path", ""),
+        "label": target.get("label", ""),
+        "mounted": False,
+        "freeBytes": None,
+        "dropInInstalled": bool(drop_in_installed),
+    }
+    if not resolved["uuid"]:
+        return resolved
+    for disk in disks:
+        if disk["uuid"] != resolved["uuid"]:
+            continue
+        if not resolved["label"]:
+            resolved["label"] = disk["label"]
+        if disk["mountpoint"]:
+            resolved["path"] = disk["mountpoint"]
+            resolved["mounted"] = True
+        break
+    if resolved["mounted"]:
+        try:
+            stats = os.statvfs(resolved["path"])
+            resolved["freeBytes"] = stats.f_bavail * stats.f_frsize
+        except OSError:
+            resolved["freeBytes"] = None
+    return resolved
+
+
+def _drop_in_installed(service):
+    return os.path.exists(TARGET_DROP_IN_TEMPLATE.format(unit=service))
+
+
+def target_status(service, disks=None):
+    if disks is None:
+        try:
+            disks = discover_disks()
+        except (BoundedProcessError, OSError, ValueError, json.JSONDecodeError):
+            disks = []
+    return resolve_target(read_target_env(), disks, _drop_in_installed(service))
+
+
+def discover(service):
+    service = validate_service(service)
+    disks = discover_disks()
+    return {
+        "services": discover_services(service),
+        "disks": disks,
+        "target": resolve_target(read_target_env(), disks, _drop_in_installed(service)),
+    }
+
+
 def parse_events(lines, local_timezone=None):
     events = {}
     zone = local_timezone or datetime.now().astimezone().tzinfo
@@ -541,6 +593,7 @@ def collect(service, weeks):
         "service": service,
         "state": service_state(service),
         "days": days,
+        "target": target_status(service),
         "summary": {
             "success": sum(day["status"] == "success" for day in days),
             "failed": sum(day["status"] == "failed" for day in days),
@@ -578,6 +631,7 @@ def main():
     parser.add_argument("--service", default="restic-backup.service")
     parser.add_argument("--weeks", type=int, default=4)
     parser.add_argument("--session-token", default="")
+    parser.add_argument("--mode", default="history", choices=["history", "discover"])
     args = parser.parse_args()
     service = str(args.service)[:MAX_SERVICE_LENGTH]
 
@@ -588,7 +642,10 @@ def main():
             os.environ[SESSION_TOKEN_ENV] = session_token
         establish_backend_session()
         service = validate_service(args.service)
-        payload = collect(service, max(2, min(args.weeks, MAX_WEEKS)))
+        if args.mode == "discover":
+            payload = discover(service)
+        else:
+            payload = collect(service, max(2, min(args.weeks, MAX_WEEKS)))
     except (
         BoundedProcessError,
         OSError,
@@ -601,6 +658,8 @@ def main():
             "service": service,
             "state": "unknown",
             "days": [],
+            "services": [],
+            "disks": [],
             "error": _bounded_error_text(error),
         }
     print(encode_payload(payload))
