@@ -27,7 +27,13 @@ Panel {
   property string setupError: ""
   property bool setupBusy: false
   property bool setupServiceFailed: false
+  property bool setupApplyPending: false
+  property bool setupAbandoned: false
+  property var discoverCollector: null
+  property string discoverRaw: ""
   property bool discoverAborted: false
+  property bool discoverStreamFinished: false
+  property bool discoverProcessExited: false
   property string state: "loading"
   property string error: ""
   property var historyCollector: null
@@ -312,20 +318,46 @@ Panel {
     setupDisks = []
     setupServices = []
     setupServiceFailed = false
+    setupApplyPending = false
+    setupAbandoned = false
     setupService = service
     loadDiscovery()
   }
 
   function closeSetup() {
+    // Leaving the wizard must never wait on a privileged child. Any pkexec still
+    // in flight is left to finish or be refused; its exit is simply ignored.
+    setupAbandoned = true
+    setupApplyPending = false
     setupOpen = false
     setupDismissed = true
     setupBusy = false
     refresh()
   }
 
+  function releaseDiscoverCollector() {
+    var collector = discoverCollector
+    discoverCollector = null
+    discoverProc.stdout = null
+    if (collector) Qt.callLater(function() { collector.destroy() })
+  }
+
   function loadDiscovery() {
     if (discoverProc.running || historyTearingDown) return
+
+    releaseDiscoverCollector()
+    discoverRaw = ""
     discoverAborted = false
+    discoverStreamFinished = false
+    discoverProcessExited = false
+
+    var collector = discoverCollectorFactory.createObject(root)
+    if (!collector) {
+      setupError = "Unable to create bounded output collector"
+      return
+    }
+    discoverCollector = collector
+    discoverProc.stdout = collector
     discoverWatchdog.restart()
     discoverProc.running = true
   }
@@ -335,27 +367,55 @@ Panel {
     discoverAborted = true
     discoverWatchdog.stop()
     setupError = message
+    releaseDiscoverCollector()
+
     if (discoverProc.running) discoverProc.signal(15)
   }
 
   function handleDiscoveryData(collector) {
-    if (discoverAborted || historyTearingDown) return
+    if (collector !== discoverCollector || discoverAborted || historyTearingDown) return
     if (collector.data.byteLength > historyCollectorLimit)
       abortDiscovery("Discovery output exceeded QML collector limit")
   }
 
+  function handleDiscoveryStreamFinished(collector) {
+    if (collector !== discoverCollector || discoverAborted || historyTearingDown) return
+    if (collector.data.byteLength > historyJsonLimit) {
+      abortDiscovery("Discovery JSON exceeded size limit")
+      return
+    }
+    discoverRaw = collector.text
+    discoverStreamFinished = true
+    finishDiscoveryIfReady()
+  }
+
   function handleDiscoveryExited(exitCode) {
-    discoverWatchdog.stop()
-    if (discoverAborted || historyTearingDown) return
+    discoverProcessExited = true
+    if (discoverAborted || historyTearingDown) {
+      discoverWatchdog.stop()
+      releaseDiscoverCollector()
+      return
+    }
     if (exitCode !== 0) {
+      discoverWatchdog.stop()
       setupError = "Discovery failed"
+      releaseDiscoverCollector()
       return
     }
-    if (discoverCollector.data.byteLength > historyJsonLimit) {
-      setupError = "Discovery JSON exceeded size limit"
-      return
-    }
-    handleDiscovery(discoverCollector.text)
+    finishDiscoveryIfReady()
+  }
+
+  function finishDiscoveryIfReady() {
+    if (!HistoryLifecycle.shouldFinish(
+      discoverStreamFinished,
+      discoverProcessExited,
+      discoverAborted,
+      historyTearingDown
+    )) return
+    discoverWatchdog.stop()
+    handleDiscovery(discoverRaw)
+    discoverRaw = ""
+    releaseDiscoverCollector()
   }
 
   function handleDiscovery(text) {
@@ -397,8 +457,10 @@ Panel {
     setupBusy = true
     setupError = ""
     setupServiceFailed = false
-    setServiceProc.command = [root.setServicePath, setupService]
-    setServiceProc.running = true
+    setupApplyPending = true
+    // The privileged write is staged here but started only from
+    // setServiceProc.onExited, so the two never race and a failed service
+    // selection escalates nothing.
     setTargetProc.command = [
       "/usr/bin/pkexec",
       root.setTargetPath,
@@ -407,7 +469,8 @@ Panel {
       "--path", setupDisk.mountpoint,
       "--label", setupDisk.label
     ]
-    setTargetProc.running = true
+    setServiceProc.command = [root.setServicePath, setupService]
+    setServiceProc.running = true
   }
 
   Component {
@@ -445,13 +508,21 @@ Panel {
     onExited: root.refresh()
   }
 
+  Component {
+    id: discoverCollectorFactory
+
+    StdioCollector {
+      id: discoverStreamCollector
+      waitForEnd: false
+      onDataChanged: root.handleDiscoveryData(discoverStreamCollector)
+      onStreamFinished: root.handleDiscoveryStreamFinished(discoverStreamCollector)
+    }
+  }
+
   Process {
     id: discoverProc
     command: [root.backendPath, "--mode", "discover", "--service", root.service]
-    stdout: StdioCollector {
-      id: discoverCollector
-      onDataChanged: root.handleDiscoveryData(discoverCollector)
-    }
+    stdout: null
     onExited: function(exitCode, exitStatus) { root.handleDiscoveryExited(exitCode) }
   }
 
@@ -459,9 +530,16 @@ Panel {
     id: setServiceProc
     command: []
     onExited: function(exitCode, exitStatus) {
-      if (root.historyTearingDown || exitCode === 0) return
-      root.setupServiceFailed = true
-      root.setupError = "Could not save the service selection"
+      if (root.historyTearingDown || root.setupAbandoned) return
+      if (!root.setupApplyPending) return
+      root.setupApplyPending = false
+      if (exitCode !== 0) {
+        root.setupServiceFailed = true
+        root.setupBusy = false
+        root.setupError = "Could not save the service selection"
+        return
+      }
+      setTargetProc.running = true
     }
   }
 
@@ -470,7 +548,7 @@ Panel {
     command: []
     stderr: StdioCollector { id: setTargetErrorCollector }
     onExited: function(exitCode, exitStatus) {
-      if (root.historyTearingDown) return
+      if (root.historyTearingDown || root.setupAbandoned) return
       root.setupBusy = false
       if (exitCode === 0) {
         root.refresh()
@@ -516,6 +594,7 @@ Panel {
     discoverAborted = true
     discoverWatchdog.stop()
     if (discoverProc.running) discoverProc.signal(15)
+    releaseDiscoverCollector()
 
     if (historyProc.running) {
       // The detached session terminator owns TERM-to-KILL escalation and
@@ -885,6 +964,8 @@ Panel {
               onClicked: {
                 root.setupBusy = true
                 root.setupError = ""
+                root.setupServiceFailed = false
+                root.setupApplyPending = false
                 setTargetProc.command = [
                   "/usr/bin/pkexec",
                   root.setTargetPath,
@@ -929,7 +1010,6 @@ Panel {
             iconText: "󰅖"
             foreground: root.foregroundColor
             bordered: true
-            enabled: !root.setupBusy
             onClicked: root.closeSetup()
           }
 
