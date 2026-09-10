@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+service=${1:?service name required}
+[[ $service =~ ^[A-Za-z0-9_.@:-]+\.service$ ]]
+exec omarchy bar set io.github.mnsosa.backup-history service "$service"

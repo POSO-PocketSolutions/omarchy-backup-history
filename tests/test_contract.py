@@ -110,6 +110,14 @@ class PluginContractTest(unittest.TestCase):
     def test_target_writer_is_executable(self):
         self.assertTrue(os.access(ROOT / "scripts" / "set-target", os.X_OK))
 
+    def test_service_setter_validates_and_uses_the_plugin_id(self):
+        setter = (ROOT / "scripts" / "set-service").read_text()
+
+        self.assertIn("^[A-Za-z0-9_.@:-]+\\.service$", setter)
+        self.assertIn("io.github.mnsosa.backup-history", setter)
+        self.assertIn('omarchy bar set io.github.mnsosa.backup-history service "$service"', setter)
+        self.assertTrue(os.access(ROOT / "scripts" / "set-service", os.X_OK))
+
 
 if __name__ == "__main__":
     unittest.main()
