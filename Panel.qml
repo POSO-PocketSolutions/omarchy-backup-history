@@ -536,13 +536,16 @@ Panel {
           spacing: Style.space(8)
 
           Text {
-            text: root.targetMounted ? "󰋊" : "󰋊"
+            id: targetIcon
+            width: Style.space(14)
+            text: root.targetMounted ? "󰋊" : "󰀦"
             color: root.targetMounted ? root.foregroundColor : root.failureColor
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.bodySmall
           }
 
           Text {
+            width: parent.width - targetIcon.width - parent.spacing
             text: root.targetSummary
             color: root.targetMounted ? root.mutedColor : root.failureColor
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
