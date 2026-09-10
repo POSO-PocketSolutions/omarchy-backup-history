@@ -33,6 +33,18 @@ TERM_GRACE_SECONDS = 0.5
 POST_KILL_WAIT_SECONDS = 0.5
 READ_CHUNK_BYTES = 64 * 1024
 
+TARGET_ENV_PATH = "/etc/backup-history/target.env"
+TARGET_DROP_IN_TEMPLATE = "/etc/systemd/system/{unit}.d/10-backup-history-target.conf"
+TARGET_ENV_MAX_BYTES = 8 * 1024
+UUID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+MOUNTPOINT_PATTERN = re.compile(r"^/[^\0\n]{0,255}$")
+LABEL_PATTERN = re.compile(r"^[A-Za-z0-9 _.:-]{0,64}$")
+TARGET_ENV_KEYS = {
+    "BACKUP_TARGET_UUID": ("uuid", UUID_PATTERN),
+    "BACKUP_TARGET_PATH": ("path", MOUNTPOINT_PATTERN),
+    "BACKUP_TARGET_LABEL": ("label", LABEL_PATTERN),
+}
+
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _ACTIVE_PROCESS = None
@@ -298,6 +310,32 @@ def validate_service(service):
     if len(service) > MAX_SERVICE_LENGTH or not SERVICE_PATTERN.fullmatch(service):
         raise ValueError("invalid systemd service name")
     return service
+
+
+def parse_target_env(text):
+    target = {"uuid": "", "path": "", "label": ""}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        entry = TARGET_ENV_KEYS.get(key.strip())
+        if not entry:
+            continue
+        name, pattern = entry
+        value = value.strip()
+        if pattern.fullmatch(value):
+            target[name] = value
+    return target
+
+
+def read_target_env(path=TARGET_ENV_PATH):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as env_file:
+            text = env_file.read(TARGET_ENV_MAX_BYTES)
+    except OSError:
+        return {"uuid": "", "path": "", "label": ""}
+    return parse_target_env(text)
 
 
 def parse_events(lines, local_timezone=None):
