@@ -1,4 +1,6 @@
 import importlib.util
+import subprocess
+import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -98,6 +100,118 @@ class WriteTest(unittest.TestCase):
     def test_clear_is_idempotent(self):
         self.writer.clear_target(self.root, "restic-backup.service")
         self.writer.clear_target(self.root, "restic-backup.service")
+
+    def test_clear_leaves_a_foreign_drop_in_in_place(self):
+        _, drop_in = self.paths()
+        drop_in.parent.mkdir(parents=True, exist_ok=True)
+        drop_in.write_text("[Service]\nExecStart=/bin/false\n")
+
+        self.writer.clear_target(self.root, "restic-backup.service")
+
+        self.assertTrue(drop_in.exists())
+        self.assertEqual(drop_in.read_text(), "[Service]\nExecStart=/bin/false\n")
+
+    def test_clear_removes_a_drop_in_matching_our_content(self):
+        _, drop_in = self.paths()
+        drop_in.parent.mkdir(parents=True, exist_ok=True)
+        drop_in.write_text(self.writer.DROP_IN_BODY)
+
+        self.writer.clear_target(self.root, "restic-backup.service")
+
+        self.assertFalse(drop_in.exists())
+
+    def test_clear_removes_env_file_unconditionally(self):
+        env, _ = self.paths()
+        env.parent.mkdir(parents=True, exist_ok=True)
+        env.write_text("anything")
+
+        self.writer.clear_target(self.root, "restic-backup.service")
+
+        self.assertFalse(env.exists())
+
+
+class RecordingResult:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+
+
+class SystemctlInvocationTest(unittest.TestCase):
+    def setUp(self):
+        self.writer = load_writer()
+        self.calls = []
+        self.addCleanup(setattr, self.writer.subprocess, "run", subprocess.run)
+
+    def fake_run(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        return RecordingResult(returncode=0)
+
+    def test_unit_exists_invokes_systemctl_with_list_argv_and_timeout(self):
+        self.writer.subprocess.run = self.fake_run
+
+        result = self.writer.unit_exists("restic-backup.service")
+
+        self.assertTrue(result)
+        self.assertEqual(len(self.calls), 1)
+        argv, kwargs = self.calls[0]
+        self.assertIsInstance(argv, list)
+        self.assertEqual(argv, [self.writer.SYSTEMCTL, "cat", "--", "restic-backup.service"])
+        self.assertNotIn("shell", kwargs)
+        self.assertEqual(kwargs["timeout"], self.writer.SYSTEMCTL_TIMEOUT_SECONDS)
+
+    def test_daemon_reload_invokes_systemctl_with_list_argv_and_timeout(self):
+        self.writer.subprocess.run = self.fake_run
+
+        self.writer.daemon_reload()
+
+        self.assertEqual(len(self.calls), 1)
+        argv, kwargs = self.calls[0]
+        self.assertIsInstance(argv, list)
+        self.assertEqual(argv, [self.writer.SYSTEMCTL, "daemon-reload"])
+        self.assertNotIn("shell", kwargs)
+        self.assertEqual(kwargs["timeout"], self.writer.SYSTEMCTL_TIMEOUT_SECONDS)
+
+
+class MainSubprocessTest(unittest.TestCase):
+    ETC_ENV_PATH = Path("/etc/backup-history/target.env")
+
+    def run_script(self, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            text=True,
+        )
+
+    def test_rejects_invalid_unit_without_touching_etc(self):
+        existed_before = self.ETC_ENV_PATH.exists()
+
+        result = self.run_script(
+            "--unit", "not-a-service", "--uuid", "1f0e", "--path", "/mnt/b", "--label", "b"
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.strip())
+        self.assertEqual(self.ETC_ENV_PATH.exists(), existed_before)
+
+    def test_rejects_invalid_uuid_without_touching_etc(self):
+        existed_before = self.ETC_ENV_PATH.exists()
+
+        result = self.run_script(
+            "--unit",
+            "restic-backup.service",
+            "--uuid",
+            "not a uuid",
+            "--path",
+            "/mnt/b",
+            "--label",
+            "b",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.strip())
+        self.assertEqual(self.ETC_ENV_PATH.exists(), existed_before)
 
 
 if __name__ == "__main__":

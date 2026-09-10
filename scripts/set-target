@@ -67,9 +67,21 @@ def write_target(root, unit, uuid, path, label):
 
 
 def clear_target(root, unit):
-    for target in (root + TARGET_ENV_PATH, root + TARGET_DROP_IN_TEMPLATE.format(unit=unit)):
+    try:
+        os.unlink(root + TARGET_ENV_PATH)
+    except FileNotFoundError:
+        pass
+
+    drop_in = root + TARGET_DROP_IN_TEMPLATE.format(unit=unit)
+    try:
+        with open(drop_in, "r", encoding="utf-8") as drop_in_file:
+            owned_by_us = drop_in_file.read() == DROP_IN_BODY
+    except FileNotFoundError:
+        owned_by_us = False
+
+    if owned_by_us:
         try:
-            os.unlink(target)
+            os.unlink(drop_in)
         except FileNotFoundError:
             pass
 
