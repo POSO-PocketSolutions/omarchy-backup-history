@@ -26,6 +26,8 @@ Panel {
   property var setupDisks: []
   property string setupError: ""
   property bool setupBusy: false
+  property bool setupServiceFailed: false
+  property bool discoverAborted: false
   property string state: "loading"
   property string error: ""
   property var historyCollector: null
@@ -40,6 +42,8 @@ Panel {
   readonly property int historyJsonLimit: 64 * 1024
   readonly property int historyCollectorLimit: 96 * 1024
   readonly property int historyWatchdogMs: 10000
+  readonly property int setupServiceLimit: 64
+  readonly property int setupDiskLimit: 32
 
   readonly property var barIdentity: hostWidget || root
   readonly property string service: String(setting("service", "restic-backup.service"))
@@ -80,10 +84,16 @@ Panel {
     var name = target.label !== "" ? target.label : target.path
     return target.freeBytes === null ? name : name + " · " + formattedBytes(target.freeBytes) + " free"
   }
-  readonly property bool setupRequired: !setupDismissed && (!targetConfigured || error.indexOf("not found") >= 0)
+  readonly property bool setupRequired: !setupDismissed && !targetConfigured
   readonly property bool showSetup: setupOpen || setupRequired
 
-  onShowSetupChanged: if (showSetup && setupServices.length === 0) loadDiscovery()
+  // Latch the wizard open: a periodic refresh may reconfigure `target` mid-step,
+  // and the wizard must survive that until closeSetup() dismisses it.
+  onShowSetupChanged: {
+    if (!showSetup) return
+    setupOpen = true
+    if (setupServices.length === 0) loadDiscovery()
+  }
 
   function pathFor(relativePath) {
     return decodeURIComponent(Qt.resolvedUrl(relativePath).toString().replace("file://", ""))
@@ -298,6 +308,10 @@ Panel {
     setupOpen = true
     setupStep = 0
     setupError = ""
+    setupDisk = null
+    setupDisks = []
+    setupServices = []
+    setupServiceFailed = false
     setupService = service
     loadDiscovery()
   }
@@ -310,26 +324,79 @@ Panel {
   }
 
   function loadDiscovery() {
-    if (discoverProc.running) return
-    discoverCollector.text = ""
+    if (discoverProc.running || historyTearingDown) return
+    discoverAborted = false
+    discoverWatchdog.restart()
     discoverProc.running = true
+  }
+
+  function abortDiscovery(message) {
+    if (discoverAborted || historyTearingDown) return
+    discoverAborted = true
+    discoverWatchdog.stop()
+    setupError = message
+    if (discoverProc.running) discoverProc.signal(15)
+  }
+
+  function handleDiscoveryData(collector) {
+    if (discoverAborted || historyTearingDown) return
+    if (collector.data.byteLength > historyCollectorLimit)
+      abortDiscovery("Discovery output exceeded QML collector limit")
+  }
+
+  function handleDiscoveryExited(exitCode) {
+    discoverWatchdog.stop()
+    if (discoverAborted || historyTearingDown) return
+    if (exitCode !== 0) {
+      setupError = "Discovery failed"
+      return
+    }
+    if (discoverCollector.data.byteLength > historyJsonLimit) {
+      setupError = "Discovery JSON exceeded size limit"
+      return
+    }
+    handleDiscovery(discoverCollector.text)
   }
 
   function handleDiscovery(text) {
     try {
       var payload = JSON.parse(text)
-      setupServices = payload.services || []
-      setupDisks = payload.disks || []
-      setupError = payload.error || ""
+      var services = Array.isArray(payload.services) ? payload.services : []
+      var disks = Array.isArray(payload.disks) ? payload.disks : []
+      setupServices = services.slice(0, setupServiceLimit).map(function(entry) {
+        return {
+          "unit": String(entry.unit || ""),
+          "state": String(entry.state || ""),
+          "exists": !!entry.exists
+        }
+      })
+      setupDisks = disks.slice(0, setupDiskLimit).map(function(entry) {
+        return {
+          "uuid": String(entry.uuid || ""),
+          "label": String(entry.label || ""),
+          "size": String(entry.size || ""),
+          "fstype": String(entry.fstype || ""),
+          "mountpoint": String(entry.mountpoint || ""),
+          "removable": !!entry.removable
+        }
+      })
+      setupError = String(payload.error || "")
     } catch (parseError) {
       setupError = "Could not read disks and services"
     }
+  }
+
+  function writerError() {
+    var message = String(setTargetErrorCollector.text || "").trim()
+    if (message === "") return "Could not write the backup target"
+    return message.slice(0, 256)
   }
 
   function applyTarget() {
     if (setupService === "" || !setupDisk || setupBusy) return
     setupBusy = true
     setupError = ""
+    setupServiceFailed = false
     setServiceProc.command = [root.setServicePath, setupService]
     setServiceProc.running = true
     setTargetProc.command = [
@@ -381,32 +448,47 @@ Panel {
   Process {
     id: discoverProc
     command: [root.backendPath, "--mode", "discover", "--service", root.service]
-    stdout: StdioCollector { id: discoverCollector }
-    onExited: function(exitCode, exitStatus) {
-      if (exitCode === 0) root.handleDiscovery(discoverCollector.text)
-      else root.setupError = "Discovery failed"
+    stdout: StdioCollector {
+      id: discoverCollector
+      onDataChanged: root.handleDiscoveryData(discoverCollector)
     }
+    onExited: function(exitCode, exitStatus) { root.handleDiscoveryExited(exitCode) }
   }
 
   Process {
     id: setServiceProc
     command: []
+    onExited: function(exitCode, exitStatus) {
+      if (root.historyTearingDown || exitCode === 0) return
+      root.setupServiceFailed = true
+      root.setupError = "Could not save the service selection"
+    }
   }
 
   Process {
     id: setTargetProc
     command: []
+    stderr: StdioCollector { id: setTargetErrorCollector }
     onExited: function(exitCode, exitStatus) {
+      if (root.historyTearingDown) return
       root.setupBusy = false
       if (exitCode === 0) {
-        root.setupStep = 3
         root.refresh()
+        if (root.setupServiceFailed) root.setupError = "Could not save the service selection"
+        else root.setupStep = 3
       } else if (exitCode === 126 || exitCode === 127) {
         root.setupError = "Authorization declined"
       } else {
-        root.setupError = "Could not write the backup target"
+        root.setupError = root.writerError()
       }
     }
+  }
+
+  Timer {
+    id: discoverWatchdog
+    interval: root.historyWatchdogMs
+    repeat: false
+    onTriggered: root.abortDiscovery("Disk discovery exceeded QML watchdog")
   }
 
   Timer {
@@ -427,6 +509,14 @@ Panel {
   Component.onDestruction: {
     historyTearingDown = true
     historyWatchdog.stop()
+
+    // Stop observing the wizard's processes. An in-flight pkexec is left alone:
+    // it is a privileged write that must either complete or be refused by the
+    // user, never be half-killed from here.
+    discoverAborted = true
+    discoverWatchdog.stop()
+    if (discoverProc.running) discoverProc.signal(15)
+
     if (historyProc.running) {
       // The detached session terminator owns TERM-to-KILL escalation and
       // survives this component. Direct TERM only accelerates graceful exit.
@@ -830,6 +920,17 @@ Panel {
               bordered: true
               onClicked: root.closeSetup()
             }
+          }
+
+          Button {
+            visible: root.setupStep !== 3
+            width: parent.width
+            text: "Cancel"
+            iconText: "󰅖"
+            foreground: root.foregroundColor
+            bordered: true
+            enabled: !root.setupBusy
+            onClicked: root.closeSetup()
           }
 
           Text {
