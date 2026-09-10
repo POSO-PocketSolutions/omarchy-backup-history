@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "HistoryLifecycle.js" as HistoryLifecycle
+import "SetupWizard.js" as SetupWizard
 
 Panel {
   id: root
@@ -21,6 +22,7 @@ Panel {
   property bool setupDismissed: false
   property int setupStep: 0
   property string setupService: ""
+  property string setupCustomService: ""
   property var setupDisk: null
   property var setupServices: []
   property var setupDisks: []
@@ -92,7 +94,12 @@ Panel {
     return target.freeBytes === null ? name : name + " · " + formattedBytes(target.freeBytes) + " free"
   }
   readonly property bool setupWriteRunning: setTargetProc.running || setServiceProc.running
-  readonly property bool setupRequired: !setupDismissed && !targetConfigured
+  readonly property bool setupCustomServiceValid: SetupWizard.serviceNameLooksValid(setupCustomService)
+  readonly property string setupUnmountedWarning: SetupWizard.unmountedWarning(setupDisk)
+  // A configured target whose drop-in is gone is not actually installed: the
+  // service reads no BACKUP_TARGET_PATH, so prompt instead of staying silent.
+  readonly property bool setupRequired: SetupWizard.setupIsRequired(
+    setupDismissed, targetConfigured, !!target && !!target.dropInInstalled)
   readonly property bool showSetup: setupOpen || setupRequired
 
   // Latch the wizard open: a periodic refresh may reconfigure `target` mid-step,
@@ -325,6 +332,7 @@ Panel {
     setupServiceFailed = false
     setupApplyPending = false
     setupService = service
+    setupCustomService = ""
     loadDiscovery()
   }
 
@@ -458,8 +466,14 @@ Panel {
     return message.slice(0, 256)
   }
 
+  function useCustomService() {
+    if (!setupCustomServiceValid) return
+    setupService = setupCustomService
+    setupStep = SetupWizard.stepAfterService(setupCustomService)
+  }
+
   function applyTarget() {
-    if (setupService === "" || !setupDisk || setupBusy) return
+    if (!SetupWizard.serviceNameLooksValid(setupService) || !setupDisk || setupBusy) return
     if (setupWriteRunning) {
       setupError = "A previous change is still being applied"
       return
@@ -543,7 +557,7 @@ Panel {
     onExited: function(exitCode, exitStatus) {
       if (root.historyTearingDown) return
       if (!root.setupApplyPending) return
-      if (root.setupWriteGeneration !== root.setupGeneration) {
+      if (!SetupWizard.writeBelongsToCurrentAttempt(root.setupWriteGeneration, root.setupGeneration)) {
         // The attempt that started this was cancelled. Escalate nothing.
         root.setupApplyPending = false
         return
@@ -565,7 +579,7 @@ Panel {
     stderr: StdioCollector { id: setTargetErrorCollector }
     onExited: function(exitCode, exitStatus) {
       if (root.historyTearingDown) return
-      if (root.setupWriteGeneration !== root.setupGeneration) {
+      if (!SetupWizard.writeBelongsToCurrentAttempt(root.setupWriteGeneration, root.setupGeneration)) {
         // A retired attempt: it may still have written to disk, so let the panel
         // catch up, but leave this session's step, busy state and error alone.
         root.refresh()
@@ -917,9 +931,51 @@ Panel {
                 bordered: root.setupService === modelData.unit
                 onClicked: {
                   root.setupService = modelData.unit
-                  root.setupStep = 1
+                  root.setupStep = SetupWizard.stepAfterService(modelData.unit)
                 }
               }
+            }
+
+            Text {
+              width: parent.width
+              text: "Not listed? Type the unit name."
+              color: root.mutedColor
+              wrapMode: Text.Wrap
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            TextField {
+              id: customServiceField
+              width: parent.width
+              text: root.setupCustomService
+              placeholderText: "my-backup.service"
+              foreground: root.foregroundColor
+              accent: root.successColor
+              onTextChanged: root.setupCustomService = text
+              onAccepted: root.useCustomService()
+            }
+
+            Text {
+              visible: root.setupCustomService !== "" && !root.setupCustomServiceValid
+              width: parent.width
+              text: "A unit name looks like my-backup.service"
+              color: root.failureColor
+              wrapMode: Text.Wrap
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Button {
+              width: parent.width
+              text: "Use this service"
+              iconText: "󰄬"
+              foreground: root.foregroundColor
+              accent: root.successColor
+              bordered: root.setupService === root.setupCustomService
+                && root.setupCustomServiceValid
+              enabled: root.setupCustomServiceValid
+              onClicked: root.useCustomService()
             }
           }
 
@@ -942,7 +998,7 @@ Panel {
                 bordered: !!root.setupDisk && root.setupDisk.uuid === modelData.uuid
                 onClicked: {
                   root.setupDisk = modelData
-                  root.setupStep = 2
+                  root.setupStep = SetupWizard.stepAfterDisk(modelData)
                 }
               }
             }
@@ -964,6 +1020,16 @@ Panel {
                 + " so the service reads $BACKUP_TARGET_PATH. Requires authorization."
             }
 
+            Text {
+              visible: root.setupUnmountedWarning !== ""
+              width: parent.width
+              wrapMode: Text.Wrap
+              color: root.failureColor
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              text: root.setupUnmountedWarning
+            }
+
             Button {
               width: parent.width
               text: root.setupBusy || root.setupWriteRunning ? "Applying…" : "Apply"
@@ -971,8 +1037,8 @@ Panel {
               foreground: root.foregroundColor
               accent: root.successColor
               bordered: true
-              enabled: !root.setupBusy && !root.setupWriteRunning
-                && root.setupService !== "" && !!root.setupDisk
+              enabled: SetupWizard.canApply(
+                root.setupService, root.setupDisk, root.setupBusy, root.setupWriteRunning)
               onClicked: root.applyTarget()
             }
 
@@ -999,7 +1065,9 @@ Panel {
                 setTargetProc.command = [
                   "/usr/bin/pkexec",
                   root.setTargetPath,
-                  "--unit", root.setupService,
+                  // Forget must undo what is installed, which is the
+                  // configured unit's drop-in, not whatever step 0 last showed.
+                  "--unit", root.service,
                   "--clear"
                 ]
                 setTargetProc.running = true
