@@ -81,5 +81,47 @@ class ParseDisksTest(unittest.TestCase):
             self.backend.parse_disks("{not json")
 
 
+SYSTEMCTL = json.dumps([
+    {"unit": "restic-backup.service", "active": "inactive", "sub": "dead"},
+    {"unit": "borg-backup.service", "active": "active", "sub": "running"},
+    {"unit": "not-a-unit", "active": "active", "sub": "running"},
+    {"unit": "user@1000.service", "active": "active", "sub": "running"},
+])
+
+
+class ParseServicesTest(unittest.TestCase):
+    def setUp(self):
+        self.backend = load_backend()
+
+    def test_keeps_only_valid_service_names(self):
+        units = [service["unit"] for service in self.backend.parse_services(SYSTEMCTL)]
+        self.assertIn("restic-backup.service", units)
+        self.assertNotIn("not-a-unit", units)
+
+    def test_reports_active_state(self):
+        services = self.backend.parse_services(SYSTEMCTL)
+        borg = next(service for service in services if service["unit"] == "borg-backup.service")
+        self.assertEqual(borg["state"], "active")
+        self.assertTrue(borg["exists"])
+
+    def test_configured_unit_is_listed_first_even_when_absent(self):
+        services = self.backend.parse_services(SYSTEMCTL, configured="missing-backup.service")
+        self.assertEqual(services[0]["unit"], "missing-backup.service")
+        self.assertFalse(services[0]["exists"])
+
+    def test_configured_unit_is_not_duplicated(self):
+        services = self.backend.parse_services(SYSTEMCTL, configured="restic-backup.service")
+        units = [service["unit"] for service in services]
+        self.assertEqual(units.count("restic-backup.service"), 1)
+        self.assertEqual(units[0], "restic-backup.service")
+
+    def test_caps_the_service_count(self):
+        many = json.dumps([
+            {"unit": f"unit-{index}.service", "active": "inactive", "sub": "dead"}
+            for index in range(200)
+        ])
+        self.assertEqual(len(self.backend.parse_services(many)), self.backend.MAX_SERVICES)
+
+
 if __name__ == "__main__":
     unittest.main()

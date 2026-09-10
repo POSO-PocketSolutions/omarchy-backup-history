@@ -48,6 +48,7 @@ TARGET_ENV_KEYS = {
 MAX_DISKS = 32
 LSBLK_TIMEOUT_SECONDS = 3.0
 LSBLK_MAX_BYTES = 256 * 1024
+MAX_SERVICES = 64
 
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -396,6 +397,52 @@ def discover_disks():
         max_stdout_bytes=LSBLK_MAX_BYTES,
     )
     return parse_disks(output, _root_source())
+
+
+def parse_services(text, configured=""):
+    document = json.loads(text)
+    services = []
+    seen = set()
+    if configured and SERVICE_PATTERN.fullmatch(configured):
+        services.append({"unit": configured, "state": "unknown", "exists": False})
+        seen.add(configured)
+    for entry in document:
+        unit = str(entry.get("unit", ""))
+        if unit in seen or not SERVICE_PATTERN.fullmatch(unit):
+            continue
+        seen.add(unit)
+        services.append({
+            "unit": unit,
+            "state": str(entry.get("active", "unknown")),
+            "exists": True,
+        })
+        if len(services) >= MAX_SERVICES:
+            break
+    if configured and services and services[0]["unit"] == configured:
+        for entry in document:
+            if str(entry.get("unit", "")) == configured:
+                services[0] = {
+                    "unit": configured,
+                    "state": str(entry.get("active", "unknown")),
+                    "exists": True,
+                }
+                break
+    return services
+
+
+def discover_services(configured=""):
+    output = bounded_run(
+        "systemctl",
+        "list-units",
+        "--type=service",
+        "--all",
+        "--no-legend",
+        "--no-pager",
+        "--output=json",
+        timeout_seconds=SYSTEMCTL_TIMEOUT_SECONDS,
+        max_stdout_bytes=LSBLK_MAX_BYTES,
+    )
+    return parse_services(output, configured)
 
 
 def parse_events(lines, local_timezone=None):
