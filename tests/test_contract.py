@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -98,6 +99,16 @@ class PluginContractTest(unittest.TestCase):
         self.assertNotIn("historyKillTimer", panel)
         self.assertNotIn("historyProc.signal(9)", panel)
         self.assertNotIn("process.wait()", backend)
+
+    def test_target_writer_uses_fixed_trusted_paths(self):
+        writer = (ROOT / "scripts" / "set-target").read_text()
+
+        self.assertIn('"/usr/bin/systemctl"', writer)
+        self.assertNotIn('subprocess.run("systemctl', writer)
+        self.assertIn("os.replace", writer)
+
+    def test_target_writer_is_executable(self):
+        self.assertTrue(os.access(ROOT / "scripts" / "set-target", os.X_OK))
 
 
 if __name__ == "__main__":
