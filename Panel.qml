@@ -16,6 +16,7 @@ Panel {
   property var summary: ({ "success": 0, "failed": 0, "missing": 0 })
   property var latest: null
   property var latestSuccess: null
+  property var target: null
   property string state: "loading"
   property string error: ""
   property var historyCollector: null
@@ -60,6 +61,14 @@ Panel {
   readonly property color statusColor: state === "failed"
     ? failureColor
     : state === "running" ? runningColor : latestSuccess ? successColor : mutedColor
+  readonly property bool targetConfigured: !!target && target.uuid !== ""
+  readonly property bool targetMounted: targetConfigured && !!target.mounted
+  readonly property string targetSummary: {
+    if (!targetConfigured) return "No backup disk selected"
+    if (!targetMounted) return "Backup disk not connected"
+    var name = target.label !== "" ? target.label : target.path
+    return target.freeBytes === null ? name : name + " · " + formattedBytes(target.freeBytes) + " free"
+  }
 
   function pathFor(relativePath) {
     return decodeURIComponent(Qt.resolvedUrl(relativePath).toString().replace("file://", ""))
@@ -71,6 +80,17 @@ Panel {
     if (seconds < 3600) return Math.max(1, Math.floor(seconds / 60)) + "m ago"
     if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago"
     return Math.floor(seconds / 86400) + "d ago"
+  }
+
+  function formattedBytes(value) {
+    var units = ["B", "KB", "MB", "GB", "TB"]
+    var size = Number(value)
+    var index = 0
+    while (size >= 1024 && index < units.length - 1) {
+      size /= 1024
+      index += 1
+    }
+    return (size < 10 ? size.toFixed(1) : Math.round(size)) + " " + units[index]
   }
 
   function formattedTime(value) {
@@ -233,6 +253,7 @@ Panel {
       summary = payload.summary || ({ "success": 0, "failed": 0, "missing": 0 })
       latest = payload.latest || null
       latestSuccess = payload.latestSuccess || null
+      target = payload.target || null
       state = payload.state || "unknown"
       error = String(payload.error || "").slice(0, 256)
     } catch (exception) {
@@ -508,6 +529,26 @@ Panel {
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.Wrap
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            text: root.targetMounted ? "󰋊" : "󰋊"
+            color: root.targetMounted ? root.foregroundColor : root.failureColor
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            text: root.targetSummary
+            color: root.targetMounted ? root.mutedColor : root.failureColor
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideMiddle
+          }
         }
 
         Row {

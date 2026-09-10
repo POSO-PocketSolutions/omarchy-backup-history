@@ -118,6 +118,14 @@ class PluginContractTest(unittest.TestCase):
         self.assertIn('omarchy bar set io.github.mnsosa.backup-history service "$service"', setter)
         self.assertTrue(os.access(ROOT / "scripts" / "set-service", os.X_OK))
 
+    def test_panel_renders_target_state(self):
+        panel = (ROOT / "Panel.qml").read_text()
+
+        self.assertIn("property var target: null", panel)
+        self.assertIn("targetConfigured", panel)
+        self.assertIn("Backup disk not connected", panel)
+        self.assertIn("payload.target", panel)
+
 
 if __name__ == "__main__":
     unittest.main()
