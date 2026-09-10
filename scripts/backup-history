@@ -45,6 +45,10 @@ TARGET_ENV_KEYS = {
     "BACKUP_TARGET_LABEL": ("label", LABEL_PATTERN),
 }
 
+MAX_DISKS = 32
+LSBLK_TIMEOUT_SECONDS = 3.0
+LSBLK_MAX_BYTES = 256 * 1024
+
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _ACTIVE_PROCESS = None
@@ -336,6 +340,62 @@ def read_target_env(path=TARGET_ENV_PATH):
     except OSError:
         return {"uuid": "", "path": "", "label": ""}
     return parse_target_env(text)
+
+
+def _flatten_block_devices(nodes):
+    for node in nodes:
+        yield node
+        for child in _flatten_block_devices(node.get("children") or []):
+            yield child
+
+
+def parse_disks(text, root_source=""):
+    document = json.loads(text)
+    disks = []
+    for node in _flatten_block_devices(document.get("blockdevices") or []):
+        uuid = node.get("uuid") or ""
+        fstype = node.get("fstype") or ""
+        if not uuid or not fstype or not UUID_PATTERN.fullmatch(uuid):
+            continue
+        if root_source and root_source.endswith("/" + str(node.get("name", ""))):
+            continue
+        disks.append({
+            "uuid": uuid,
+            "label": node.get("label") or "",
+            "size": node.get("size") or "",
+            "fstype": fstype,
+            "mountpoint": node.get("mountpoint") or "",
+            "removable": bool(node.get("rm")),
+        })
+        if len(disks) >= MAX_DISKS:
+            break
+    return disks
+
+
+def _root_source():
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as mounts:
+            for line in mounts:
+                fields = line.split(" - ")
+                if len(fields) < 2:
+                    continue
+                if fields[0].split()[4] == "/":
+                    return fields[1].split()[1]
+    except (OSError, IndexError):
+        return ""
+    return ""
+
+
+def discover_disks():
+    output = bounded_run(
+        "lsblk",
+        "-J",
+        "-o",
+        "NAME,UUID,LABEL,SIZE,FSTYPE,MOUNTPOINT,RM,TYPE",
+        timeout_seconds=LSBLK_TIMEOUT_SECONDS,
+        max_stdout_bytes=LSBLK_MAX_BYTES,
+    )
+    return parse_disks(output, _root_source())
 
 
 def parse_events(lines, local_timezone=None):
