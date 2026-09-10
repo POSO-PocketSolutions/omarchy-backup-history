@@ -84,7 +84,13 @@ The disk is remembered by filesystem UUID. The panel resolves that UUID to a
 current mountpoint each time it refreshes and shows "Backup disk not
 connected" when the UUID isn't present on the system. You can also choose a
 disk that isn't mounted right now; in that case `BACKUP_TARGET_PATH` stays
-empty until the disk is mounted.
+empty. Backups will fail while it is empty, and mounting the disk later does
+not fill it in on its own — the panel shows the disk as connected again, but
+`target.env` is only rewritten when you reopen the wizard and apply once more.
+Mount the disk first if you can; otherwise re-run **Apply** after mounting it.
+
+The first step also accepts a unit name typed by hand, for a backup service
+the automatic list did not offer.
 
 The review step also has a **Forget the current disk** action, which clears
 the configuration. It removes the drop-in file only when its contents are
