@@ -145,6 +145,18 @@ class PluginContractTest(unittest.TestCase):
         self.assertIn("function applyTarget()", panel)
         self.assertIn("--clear", panel)
 
+    def test_readme_documents_the_target_contract(self):
+        readme = (ROOT / "README.md").read_text()
+
+        self.assertIn("BACKUP_TARGET_PATH", readme)
+        self.assertIn("/etc/backup-history/target.env", readme)
+        self.assertIn("10-backup-history-target.conf", readme)
+
+    def test_manifest_version_is_bumped_for_the_target_feature(self):
+        manifest = json.loads((ROOT / "manifest.json").read_text())
+
+        self.assertEqual(manifest["version"], "0.3.0")
+
 
 if __name__ == "__main__":
     unittest.main()
