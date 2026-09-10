@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mnsosa.backup-history",
   "name": "Backup History",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "author": "Matías Sosa",
   "license": "MIT",
   "description": "Backup status, actions, logs, and four-week history for systemd services.",

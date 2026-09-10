@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 HARNESS = ROOT / "tests" / "qml" / "process-lifecycle.qml"
 DESTRUCTION_HARNESS = ROOT / "tests" / "qml" / "process-destruction.qml"
+WIZARD_HARNESS = ROOT / "tests" / "qml" / "setup-wizard.qml"
 DESTRUCTION_DIRECTORY = Path("/tmp/backup-history-qml-destruction")
 TERMINATOR = ROOT / "scripts" / "terminate-history-session"
 SESSION_TREE_FIXTURE = ROOT / "tests" / "fixtures" / "session-tree"
@@ -65,6 +66,28 @@ class QmlRuntimeTest(unittest.TestCase):
         self.assertTrue(DETACHED_MARKER.exists(), "detached process died with QML root")
         self.assertEqual(DETACHED_MARKER.read_text(), "survived")
         DETACHED_MARKER.unlink(missing_ok=True)
+
+    def test_setup_wizard_steps_escalate_once_and_retire_cancelled_writes(self):
+        environment = os.environ.copy()
+        environment["NO_COLOR"] = "1"
+
+        with tempfile.TemporaryDirectory() as config_directory:
+            config_directory = Path(config_directory)
+            harness_copy = config_directory / WIZARD_HARNESS.name
+            shutil.copy2(WIZARD_HARNESS, harness_copy)
+            shutil.copy2(ROOT / "SetupWizard.js", config_directory / "SetupWizard.js")
+            result = subprocess.run(
+                ["quickshell", "--no-duplicate", "--path", str(harness_copy)],
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=15,
+            )
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("QML_WIZARD_OK writes=2", output)
+        self.assertNotIn("QML_WIZARD_FAIL", output)
 
     def test_component_destruction_dispatches_authenticated_cleanup_for_live_tree(self):
         shutil.rmtree(DESTRUCTION_DIRECTORY, ignore_errors=True)

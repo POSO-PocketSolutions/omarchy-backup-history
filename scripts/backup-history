@@ -33,6 +33,36 @@ TERM_GRACE_SECONDS = 0.5
 POST_KILL_WAIT_SECONDS = 0.5
 READ_CHUNK_BYTES = 64 * 1024
 
+TARGET_ENV_PATH = "/etc/backup-history/target.env"
+TARGET_DROP_IN_TEMPLATE = "/etc/systemd/system/{unit}.d/10-backup-history-target.conf"
+TARGET_ENV_MAX_BYTES = 8 * 1024
+UUID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+# Mirrors scripts/set-target: the wizard must never offer a disk whose label or
+# mountpoint the privileged writer would then refuse.
+UNSAFE_TEXT_CLASS = r"\x00-\x1f\x7f=$`\"'\\"
+MOUNTPOINT_PATTERN = re.compile(rf"^/[^{UNSAFE_TEXT_CLASS}]{{0,255}}$")
+LABEL_PATTERN = re.compile(rf"^[^{UNSAFE_TEXT_CLASS}]{{0,64}}$")
+TARGET_ENV_KEYS = {
+    "BACKUP_TARGET_UUID": ("uuid", UUID_PATTERN),
+    "BACKUP_TARGET_PATH": ("path", MOUNTPOINT_PATTERN),
+    "BACKUP_TARGET_LABEL": ("label", LABEL_PATTERN),
+}
+
+MAX_DISKS = 32
+LSBLK_TIMEOUT_SECONDS = 3.0
+LSBLK_MAX_BYTES = 256 * 1024
+MAX_SERVICES = 64
+SERVICE_NAME_HINTS = (
+    "backup",
+    "restic",
+    "borg",
+    "rsync",
+    "snapshot",
+    "duplicity",
+    "timeshift",
+)
+
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _ACTIVE_PROCESS = None
@@ -300,6 +330,229 @@ def validate_service(service):
     return service
 
 
+def parse_target_env(text):
+    target = {"uuid": "", "path": "", "label": ""}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        entry = TARGET_ENV_KEYS.get(key.strip())
+        if not entry:
+            continue
+        name, pattern = entry
+        value = value.strip()
+        if pattern.fullmatch(value):
+            target[name] = value
+    return target
+
+
+def read_target_env(path=TARGET_ENV_PATH):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as env_file:
+            text = env_file.read(TARGET_ENV_MAX_BYTES)
+    except OSError:
+        return {"uuid": "", "path": "", "label": ""}
+    return parse_target_env(text)
+
+
+def _flatten_block_devices(nodes):
+    for node in nodes:
+        yield node
+        for child in _flatten_block_devices(node.get("children") or []):
+            yield child
+
+
+def writer_accepts(label, mountpoint):
+    """Whether scripts/set-target would accept this disk's label and mountpoint."""
+    if not LABEL_PATTERN.fullmatch(label):
+        return False
+    if not mountpoint:
+        return True
+    if not MOUNTPOINT_PATTERN.fullmatch(mountpoint):
+        return False
+    return ".." not in mountpoint.split("/")
+
+
+def parse_disks(text, root_source=""):
+    document = json.loads(text)
+    disks = []
+    for node in _flatten_block_devices(document.get("blockdevices") or []):
+        uuid = node.get("uuid") or ""
+        fstype = node.get("fstype") or ""
+        if not uuid or not fstype or not UUID_PATTERN.fullmatch(uuid):
+            continue
+        if root_source and root_source.endswith("/" + str(node.get("name", ""))):
+            continue
+        if node.get("mountpoint") == "/":
+            continue
+        label = node.get("label") or ""
+        mountpoint = node.get("mountpoint") or ""
+        if not writer_accepts(label, mountpoint):
+            continue
+        disks.append({
+            "uuid": uuid,
+            "label": label,
+            "size": node.get("size") or "",
+            "fstype": fstype,
+            "mountpoint": mountpoint,
+            "removable": bool(node.get("rm")),
+        })
+        if len(disks) >= MAX_DISKS:
+            break
+    return disks
+
+
+def _root_source():
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as mounts:
+            for line in mounts:
+                fields = line.split(" - ")
+                if len(fields) < 2:
+                    continue
+                if fields[0].split()[4] == "/":
+                    return fields[1].split()[1]
+    except (OSError, IndexError):
+        return ""
+    return ""
+
+
+def discover_disks():
+    output = bounded_run(
+        "lsblk",
+        "-J",
+        "-o",
+        "NAME,UUID,LABEL,SIZE,FSTYPE,MOUNTPOINT,RM,TYPE",
+        timeout_seconds=LSBLK_TIMEOUT_SECONDS,
+        max_stdout_bytes=LSBLK_MAX_BYTES,
+    )
+    return parse_disks(output, _root_source())
+
+
+def service_stem(unit):
+    """The unit name without its `.service` suffix, lowercased."""
+    return unit[: -len(".service")].lower() if unit.endswith(".service") else unit.lower()
+
+
+def is_backup_candidate(entry, unit, configured_stem=""):
+    """Keep plausible backup units only.
+
+    `systemctl list-units` does not report `Type=`, so a listing that does carry
+    it is trusted (oneshot only) and anything else falls back to a name
+    heuristic. The configured unit is pinned separately by parse_services and
+    never has to pass this filter.
+    """
+    unit_type = str(entry.get("type") or "").strip().lower()
+    if unit_type:
+        return unit_type == "oneshot"
+    name = unit.lower()
+    if configured_stem and configured_stem in name:
+        return True
+    return any(hint in name for hint in SERVICE_NAME_HINTS)
+
+
+def parse_services(text, configured=""):
+    document = json.loads(text)
+    services = []
+    seen = set()
+    configured_stem = ""
+    if configured and SERVICE_PATTERN.fullmatch(configured):
+        services.append({"unit": configured, "state": "unknown", "exists": False})
+        seen.add(configured)
+        configured_stem = service_stem(configured)
+    for entry in document:
+        unit = str(entry.get("unit", ""))
+        if unit in seen or not SERVICE_PATTERN.fullmatch(unit):
+            continue
+        if not is_backup_candidate(entry, unit, configured_stem):
+            continue
+        seen.add(unit)
+        services.append({
+            "unit": unit,
+            "state": str(entry.get("active", "unknown")),
+            "exists": True,
+        })
+        if len(services) >= MAX_SERVICES:
+            break
+    if configured and services and services[0]["unit"] == configured:
+        for entry in document:
+            if str(entry.get("unit", "")) == configured:
+                services[0] = {
+                    "unit": configured,
+                    "state": str(entry.get("active", "unknown")),
+                    "exists": True,
+                }
+                break
+    return services
+
+
+def discover_services(configured=""):
+    output = bounded_run(
+        "systemctl",
+        "list-units",
+        "--type=service",
+        "--all",
+        "--no-legend",
+        "--no-pager",
+        "--output=json",
+        timeout_seconds=SYSTEMCTL_TIMEOUT_SECONDS,
+        max_stdout_bytes=LSBLK_MAX_BYTES,
+    )
+    return parse_services(output, configured)
+
+
+def resolve_target(target, disks, drop_in_installed):
+    resolved = {
+        "uuid": target.get("uuid", ""),
+        "path": target.get("path", ""),
+        "label": target.get("label", ""),
+        "mounted": False,
+        "freeBytes": None,
+        "dropInInstalled": bool(drop_in_installed),
+    }
+    if not resolved["uuid"]:
+        return resolved
+    for disk in disks:
+        if disk["uuid"] != resolved["uuid"]:
+            continue
+        if not resolved["label"]:
+            resolved["label"] = disk["label"]
+        if disk["mountpoint"]:
+            resolved["path"] = disk["mountpoint"]
+            resolved["mounted"] = True
+        break
+    if resolved["mounted"]:
+        try:
+            stats = os.statvfs(resolved["path"])
+            resolved["freeBytes"] = stats.f_bavail * stats.f_frsize
+        except OSError:
+            resolved["freeBytes"] = None
+    return resolved
+
+
+def _drop_in_installed(service):
+    return os.path.exists(TARGET_DROP_IN_TEMPLATE.format(unit=service))
+
+
+def target_status(service, disks=None):
+    if disks is None:
+        try:
+            disks = discover_disks()
+        except (BoundedProcessError, OSError, ValueError, json.JSONDecodeError):
+            disks = []
+    return resolve_target(read_target_env(), disks, _drop_in_installed(service))
+
+
+def discover(service):
+    service = validate_service(service)
+    disks = discover_disks()
+    return {
+        "services": discover_services(service),
+        "disks": disks,
+        "target": resolve_target(read_target_env(), disks, _drop_in_installed(service)),
+    }
+
+
 def parse_events(lines, local_timezone=None):
     events = {}
     zone = local_timezone or datetime.now().astimezone().tzinfo
@@ -394,6 +647,7 @@ def collect(service, weeks):
         "service": service,
         "state": service_state(service),
         "days": days,
+        "target": target_status(service),
         "summary": {
             "success": sum(day["status"] == "success" for day in days),
             "failed": sum(day["status"] == "failed" for day in days),
@@ -431,6 +685,7 @@ def main():
     parser.add_argument("--service", default="restic-backup.service")
     parser.add_argument("--weeks", type=int, default=4)
     parser.add_argument("--session-token", default="")
+    parser.add_argument("--mode", default="history", choices=["history", "discover"])
     args = parser.parse_args()
     service = str(args.service)[:MAX_SERVICE_LENGTH]
 
@@ -441,7 +696,10 @@ def main():
             os.environ[SESSION_TOKEN_ENV] = session_token
         establish_backend_session()
         service = validate_service(args.service)
-        payload = collect(service, max(2, min(args.weeks, MAX_WEEKS)))
+        if args.mode == "discover":
+            payload = discover(service)
+        else:
+            payload = collect(service, max(2, min(args.weeks, MAX_WEEKS)))
     except (
         BoundedProcessError,
         OSError,
@@ -454,6 +712,8 @@ def main():
             "service": service,
             "state": "unknown",
             "days": [],
+            "services": [],
+            "disks": [],
             "error": _bounded_error_text(error),
         }
     print(encode_payload(payload))

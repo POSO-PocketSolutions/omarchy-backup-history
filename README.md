@@ -51,6 +51,54 @@ flowchart TD
 
 Because detection relies on systemd's own unit lifecycle, a run that exits non-zero is recorded as `failed` by systemd and shown in red — no per-tool parsing required.
 
+## Choosing a backup disk
+
+A fresh install opens a setup wizard the first time you open the panel; **Change
+backup disk** reopens it later. The wizard has four steps: choose a backup
+service, choose a disk, review and apply, then verify with a test backup. You
+can cancel on the first three steps.
+
+Applying on the review step is the only point that asks for authorization. It
+runs `scripts/set-target` through `pkexec`, which writes two files and reloads
+systemd:
+
+```
+/etc/backup-history/target.env
+/etc/systemd/system/<your-unit>.d/10-backup-history-target.conf
+```
+
+`target.env` defines `BACKUP_TARGET_UUID`, `BACKUP_TARGET_PATH`, and
+`BACKUP_TARGET_LABEL`. The drop-in adds nothing but
+`EnvironmentFile=-/etc/backup-history/target.env`, so your backup script reads
+the target from the environment:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+: "${BACKUP_TARGET_PATH:?no backup disk selected}"
+mountpoint -q "$BACKUP_TARGET_PATH"
+restic -r "$BACKUP_TARGET_PATH/restic" backup /home
+```
+
+The disk is remembered by filesystem UUID. The panel resolves that UUID to a
+current mountpoint each time it refreshes and shows "Backup disk not
+connected" when the UUID isn't present on the system. You can also choose a
+disk that isn't mounted right now; in that case `BACKUP_TARGET_PATH` stays
+empty. Backups will fail while it is empty, and mounting the disk later does
+not fill it in on its own — the panel shows the disk as connected again, but
+`target.env` is only rewritten when you reopen the wizard and apply once more.
+Mount the disk first if you can; otherwise re-run **Apply** after mounting it.
+
+The first step also accepts a unit name typed by hand, for a backup service
+the automatic list did not offer.
+
+The review step also has a **Forget the current disk** action, which clears
+the configuration. It removes the drop-in file only when its contents are
+exactly what this plugin wrote, so a drop-in you've hand-edited is left alone.
+
+The plugin never learns what your script writes to that path — it publishes a
+destination and nothing else.
+
 ## Requirements
 
 - Omarchy with shell plugin support.
@@ -89,7 +137,12 @@ The service must be managed by systemd, and its journal must be readable by the 
 omarchy plugin remove io.github.mnsosa.backup-history --yes
 ```
 
-Removal deletes the installed plugin checkout. It does not modify or remove your backup service, journal, credentials, or backup data.
+Removal deletes the installed plugin checkout. It does not modify or remove your
+backup service, journal, credentials, or backup data. The target drop-in and
+`target.env` are left in place; because the drop-in uses `EnvironmentFile=-`, a
+missing file never fails the unit. Remove them with
+`sudo rm -rf /etc/backup-history /etc/systemd/system/<your-unit>.d/10-backup-history-target.conf`
+followed by `sudo systemctl daemon-reload`.
 
 ## Development
 
