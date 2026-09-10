@@ -38,6 +38,22 @@ class ValidationTest(unittest.TestCase):
         )
         self.assertEqual(values["path"], "")
 
+    def test_accepts_a_non_ascii_label_and_mountpoint(self):
+        values = self.writer.validate_values(
+            "restic-backup.service",
+            "1f0e5a3c",
+            "/run/media/user/Sauvegarde-été",
+            "Sauvegarde-été",
+        )
+        self.assertEqual(values["label"], "Sauvegarde-été")
+        self.assertEqual(values["path"], "/run/media/user/Sauvegarde-été")
+
+    def test_accepts_ordinary_punctuation_in_a_label(self):
+        values = self.writer.validate_values(
+            "restic-backup.service", "1f0e5a3c", "/mnt/My Disk (2)", "My Disk (2)"
+        )
+        self.assertEqual(values["label"], "My Disk (2)")
+
     def test_rejects_bad_inputs(self):
         cases = [
             ("restic-backup", "1f0e", "/mnt/b", "b"),
@@ -46,6 +62,12 @@ class ValidationTest(unittest.TestCase):
             ("restic-backup.service", "1f0e", "/mnt/../etc", "b"),
             ("restic-backup.service", "1f0e", "/mnt/b\nBACKUP_TARGET_PATH=/etc", "b"),
             ("restic-backup.service", "1f0e", "/mnt/b", "bad;label$(id)"),
+            ("restic-backup.service", "1f0e", "/mnt/b", "label=value"),
+            ("restic-backup.service", "1f0e", "/mnt/b", "label\nBACKUP_TARGET_PATH=/etc"),
+            ("restic-backup.service", "1f0e", "/mnt/b", "back`id`tick"),
+            ("restic-backup.service", "1f0e", "/mnt/b", 'quo"te'),
+            ("restic-backup.service", "1f0e", "/mnt/b=x", "b"),
+            ("restic-backup.service", "1f0e", "/mnt/b", "x" * 65),
             ("../../etc/passwd.service", "1f0e", "/mnt/b", "b"),
         ]
         for unit, uuid, path, label in cases:

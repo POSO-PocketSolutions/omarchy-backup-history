@@ -37,8 +37,12 @@ TARGET_ENV_PATH = "/etc/backup-history/target.env"
 TARGET_DROP_IN_TEMPLATE = "/etc/systemd/system/{unit}.d/10-backup-history-target.conf"
 TARGET_ENV_MAX_BYTES = 8 * 1024
 UUID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
-MOUNTPOINT_PATTERN = re.compile(r"^/[^\0\n]{0,255}$")
-LABEL_PATTERN = re.compile(r"^[A-Za-z0-9 _.:-]{0,64}$")
+
+# Mirrors scripts/set-target: the wizard must never offer a disk whose label or
+# mountpoint the privileged writer would then refuse.
+UNSAFE_TEXT_CLASS = r"\x00-\x1f\x7f=$`\"'\\"
+MOUNTPOINT_PATTERN = re.compile(rf"^/[^{UNSAFE_TEXT_CLASS}]{{0,255}}$")
+LABEL_PATTERN = re.compile(rf"^[^{UNSAFE_TEXT_CLASS}]{{0,64}}$")
 TARGET_ENV_KEYS = {
     "BACKUP_TARGET_UUID": ("uuid", UUID_PATTERN),
     "BACKUP_TARGET_PATH": ("path", MOUNTPOINT_PATTERN),
@@ -359,6 +363,17 @@ def _flatten_block_devices(nodes):
             yield child
 
 
+def writer_accepts(label, mountpoint):
+    """Whether scripts/set-target would accept this disk's label and mountpoint."""
+    if not LABEL_PATTERN.fullmatch(label):
+        return False
+    if not mountpoint:
+        return True
+    if not MOUNTPOINT_PATTERN.fullmatch(mountpoint):
+        return False
+    return ".." not in mountpoint.split("/")
+
+
 def parse_disks(text, root_source=""):
     document = json.loads(text)
     disks = []
@@ -371,12 +386,16 @@ def parse_disks(text, root_source=""):
             continue
         if node.get("mountpoint") == "/":
             continue
+        label = node.get("label") or ""
+        mountpoint = node.get("mountpoint") or ""
+        if not writer_accepts(label, mountpoint):
+            continue
         disks.append({
             "uuid": uuid,
-            "label": node.get("label") or "",
+            "label": label,
             "size": node.get("size") or "",
             "fstype": fstype,
-            "mountpoint": node.get("mountpoint") or "",
+            "mountpoint": mountpoint,
             "removable": bool(node.get("rm")),
         })
         if len(disks) >= MAX_DISKS:

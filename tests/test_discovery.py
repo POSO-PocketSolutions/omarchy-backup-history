@@ -78,6 +78,44 @@ class ParseDisksTest(unittest.TestCase):
         ]})
         self.assertEqual(len(self.backend.parse_disks(many)), self.backend.MAX_DISKS)
 
+    def test_offers_a_disk_with_a_non_ascii_label_and_mountpoint(self):
+        accented = json.dumps({"blockdevices": [
+            {
+                "name": "sdc1", "type": "part", "uuid": "cccc-dddd",
+                "label": "Sauvegarde-été", "size": "2T", "fstype": "ext4",
+                "mountpoint": "/run/media/user/Sauvegarde-été", "rm": True,
+            },
+        ]})
+        disks = self.backend.parse_disks(accented)
+        self.assertEqual([disk["label"] for disk in disks], ["Sauvegarde-été"])
+        self.assertEqual(disks[0]["mountpoint"], "/run/media/user/Sauvegarde-été")
+
+    def test_never_offers_a_disk_the_writer_would_refuse(self):
+        dangerous = json.dumps({"blockdevices": [
+            {
+                "name": "sdc1", "type": "part", "uuid": "cccc-1111",
+                "label": "label=value", "size": "2T", "fstype": "ext4",
+                "mountpoint": "/mnt/a", "rm": True,
+            },
+            {
+                "name": "sdc2", "type": "part", "uuid": "cccc-2222",
+                "label": "line\nBACKUP_TARGET_PATH=/etc", "size": "2T",
+                "fstype": "ext4", "mountpoint": "/mnt/b", "rm": True,
+            },
+            {
+                "name": "sdc3", "type": "part", "uuid": "cccc-3333",
+                "label": "escape", "size": "2T", "fstype": "ext4",
+                "mountpoint": "/mnt/../etc", "rm": True,
+            },
+            {
+                "name": "sdc4", "type": "part", "uuid": "cccc-4444",
+                "label": "fine", "size": "2T", "fstype": "ext4",
+                "mountpoint": "/mnt/fine", "rm": True,
+            },
+        ]})
+        disks = self.backend.parse_disks(dangerous)
+        self.assertEqual([disk["uuid"] for disk in disks], ["cccc-4444"])
+
     def test_malformed_json_raises_value_error(self):
         with self.assertRaises(ValueError):
             self.backend.parse_disks("{not json")

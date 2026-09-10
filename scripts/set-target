@@ -16,8 +16,14 @@ SYSTEMCTL_TIMEOUT_SECONDS = 10
 
 SERVICE_PATTERN = re.compile(r"^[A-Za-z0-9_.@:-]+\.service$")
 UUID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
-MOUNTPOINT_PATTERN = re.compile(r"^/[A-Za-z0-9 _.:@+/-]{0,255}$")
-LABEL_PATTERN = re.compile(r"^[A-Za-z0-9 _.:-]{0,64}$")
+
+# Labels and mountpoints are arbitrary user text — accented, spaced, or
+# parenthesised names are ordinary. Only what could break out of a
+# `KEY=value` environment file or a shell is refused: control characters
+# (newline included), `=`, `$`, backtick, quotes and backslash.
+UNSAFE_TEXT_CLASS = r"\x00-\x1f\x7f=$`\"'\\"
+MOUNTPOINT_PATTERN = re.compile(rf"^/[^{UNSAFE_TEXT_CLASS}]{{0,255}}$")
+LABEL_PATTERN = re.compile(rf"^[^{UNSAFE_TEXT_CLASS}]{{0,64}}$")
 
 DROP_IN_BODY = "[Service]\nEnvironmentFile=-{env_path}\n".format(env_path=TARGET_ENV_PATH)
 
