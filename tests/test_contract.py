@@ -126,6 +126,25 @@ class PluginContractTest(unittest.TestCase):
         self.assertIn("Backup disk not connected", panel)
         self.assertIn("payload.target", panel)
 
+    def test_panel_has_setup_wizard_wiring(self):
+        panel = (ROOT / "Panel.qml").read_text()
+
+        self.assertIn("property bool setupOpen", panel)
+        self.assertIn("setupRequired", panel)
+        self.assertIn('"--mode", "discover"', panel)
+        self.assertIn("scripts/set-target", panel)
+        self.assertIn("scripts/set-service", panel)
+        self.assertIn("/usr/bin/pkexec", panel)
+        self.assertIn("Change backup disk", panel)
+
+    def test_wizard_escalates_only_on_apply(self):
+        panel = (ROOT / "Panel.qml").read_text()
+
+        # Escalation happens only on the review step: apply, and forget.
+        self.assertEqual(panel.count("setTargetProc.running = true"), 2)
+        self.assertIn("function applyTarget()", panel)
+        self.assertIn("--clear", panel)
+
 
 if __name__ == "__main__":
     unittest.main()

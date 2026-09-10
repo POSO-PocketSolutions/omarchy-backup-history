@@ -17,6 +17,15 @@ Panel {
   property var latest: null
   property var latestSuccess: null
   property var target: null
+  property bool setupOpen: false
+  property bool setupDismissed: false
+  property int setupStep: 0
+  property string setupService: ""
+  property var setupDisk: null
+  property var setupServices: []
+  property var setupDisks: []
+  property string setupError: ""
+  property bool setupBusy: false
   property string state: "loading"
   property string error: ""
   property var historyCollector: null
@@ -46,6 +55,8 @@ Panel {
   readonly property string sessionTerminatorPath: pathFor("scripts/terminate-history-session")
   readonly property string runPath: pathFor("scripts/run-backup")
   readonly property string logsPath: pathFor("scripts/open-logs")
+  readonly property string setTargetPath: pathFor("scripts/set-target")
+  readonly property string setServicePath: pathFor("scripts/set-service")
   readonly property string shortStatus: {
     if (state === "running") return "Backup in progress"
     if (state === "failed") return "Last backup failed"
@@ -69,6 +80,10 @@ Panel {
     var name = target.label !== "" ? target.label : target.path
     return target.freeBytes === null ? name : name + " · " + formattedBytes(target.freeBytes) + " free"
   }
+  readonly property bool setupRequired: !setupDismissed && (!targetConfigured || error.indexOf("not found") >= 0)
+  readonly property bool showSetup: setupOpen || setupRequired
+
+  onShowSetupChanged: if (showSetup && setupServices.length === 0) loadDiscovery()
 
   function pathFor(relativePath) {
     return decodeURIComponent(Qt.resolvedUrl(relativePath).toString().replace("file://", ""))
@@ -279,6 +294,55 @@ Panel {
     if (bar) bar.run(logsPath + " " + Util.shellQuote(service))
   }
 
+  function openSetup() {
+    setupOpen = true
+    setupStep = 0
+    setupError = ""
+    setupService = service
+    loadDiscovery()
+  }
+
+  function closeSetup() {
+    setupOpen = false
+    setupDismissed = true
+    setupBusy = false
+    refresh()
+  }
+
+  function loadDiscovery() {
+    if (discoverProc.running) return
+    discoverCollector.text = ""
+    discoverProc.running = true
+  }
+
+  function handleDiscovery(text) {
+    try {
+      var payload = JSON.parse(text)
+      setupServices = payload.services || []
+      setupDisks = payload.disks || []
+      setupError = payload.error || ""
+    } catch (parseError) {
+      setupError = "Could not read disks and services"
+    }
+  }
+
+  function applyTarget() {
+    if (setupService === "" || !setupDisk || setupBusy) return
+    setupBusy = true
+    setupError = ""
+    setServiceProc.command = [root.setServicePath, setupService]
+    setServiceProc.running = true
+    setTargetProc.command = [
+      "/usr/bin/pkexec",
+      root.setTargetPath,
+      "--unit", setupService,
+      "--uuid", setupDisk.uuid,
+      "--path", setupDisk.mountpoint,
+      "--label", setupDisk.label
+    ]
+    setTargetProc.running = true
+  }
+
   Component {
     id: historyCollectorFactory
 
@@ -312,6 +376,37 @@ Panel {
     id: runProc
     command: [root.runPath, root.service]
     onExited: root.refresh()
+  }
+
+  Process {
+    id: discoverProc
+    command: [root.backendPath, "--mode", "discover", "--service", root.service]
+    stdout: StdioCollector { id: discoverCollector }
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode === 0) root.handleDiscovery(discoverCollector.text)
+      else root.setupError = "Discovery failed"
+    }
+  }
+
+  Process {
+    id: setServiceProc
+    command: []
+  }
+
+  Process {
+    id: setTargetProc
+    command: []
+    onExited: function(exitCode, exitStatus) {
+      root.setupBusy = false
+      if (exitCode === 0) {
+        root.setupStep = 3
+        root.refresh()
+      } else if (exitCode === 126 || exitCode === 127) {
+        root.setupError = "Authorization declined"
+      } else {
+        root.setupError = "Could not write the backup target"
+      }
+    }
   }
 
   Timer {
@@ -419,6 +514,7 @@ Panel {
         }
 
         Column {
+          visible: !root.showSetup
           width: parent.width
           spacing: Style.space(10)
 
@@ -522,7 +618,7 @@ Panel {
         }
 
         Text {
-          visible: root.error !== ""
+          visible: !root.showSetup && root.error !== ""
           width: parent.width
           text: root.error
           color: root.failureColor
@@ -532,6 +628,7 @@ Panel {
         }
 
         Row {
+          visible: !root.showSetup
           width: parent.width
           spacing: Style.space(8)
 
@@ -555,6 +652,7 @@ Panel {
         }
 
         Row {
+          visible: !root.showSetup
           width: parent.width
           spacing: Style.space(10)
 
@@ -577,6 +675,171 @@ Panel {
             foreground: root.foregroundColor
             bordered: true
             onClicked: root.openLogs()
+          }
+        }
+
+        Row {
+          visible: !root.showSetup
+          width: parent.width
+          spacing: Style.space(10)
+
+          Button {
+            width: parent.width
+            text: "Change backup disk"
+            iconText: "󰋊"
+            foreground: root.foregroundColor
+            bordered: true
+            onClicked: root.openSetup()
+          }
+        }
+
+        Column {
+          id: setupColumn
+          visible: root.showSetup
+          width: parent.width
+          spacing: Style.space(12)
+
+          Text {
+            text: root.setupStep === 0 ? "Choose a backup service"
+              : root.setupStep === 1 ? "Choose a backup disk"
+              : root.setupStep === 2 ? "Review and apply"
+              : "Setup complete"
+            color: root.foregroundColor
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          Column {
+            visible: root.setupStep === 0
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.setupServices
+
+              Button {
+                required property var modelData
+                width: setupColumn.width
+                text: modelData.unit + (modelData.exists ? "" : " (not installed)")
+                foreground: root.foregroundColor
+                accent: root.successColor
+                bordered: root.setupService === modelData.unit
+                onClicked: {
+                  root.setupService = modelData.unit
+                  root.setupStep = 1
+                }
+              }
+            }
+          }
+
+          Column {
+            visible: root.setupStep === 1
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.setupDisks
+
+              Button {
+                required property var modelData
+                width: setupColumn.width
+                text: (modelData.label !== "" ? modelData.label : modelData.uuid)
+                  + " · " + modelData.size + " · " + modelData.fstype
+                  + (modelData.mountpoint === "" ? " · not mounted" : "")
+                foreground: root.foregroundColor
+                accent: root.successColor
+                bordered: !!root.setupDisk && root.setupDisk.uuid === modelData.uuid
+                onClicked: {
+                  root.setupDisk = modelData
+                  root.setupStep = 2
+                }
+              }
+            }
+          }
+
+          Column {
+            visible: root.setupStep === 2
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              color: root.mutedColor
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              text: "Writes /etc/backup-history/target.env and a drop-in for "
+                + root.setupService
+                + " so the service reads $BACKUP_TARGET_PATH. Requires authorization."
+            }
+
+            Button {
+              width: parent.width
+              text: root.setupBusy ? "Applying…" : "Apply"
+              iconText: "󰄬"
+              foreground: root.foregroundColor
+              accent: root.successColor
+              bordered: true
+              enabled: !root.setupBusy && root.setupService !== "" && !!root.setupDisk
+              onClicked: root.applyTarget()
+            }
+
+            Button {
+              width: parent.width
+              visible: root.targetConfigured
+              text: "Forget the current disk"
+              iconText: "󰆴"
+              foreground: root.foregroundColor
+              bordered: true
+              enabled: !root.setupBusy
+              onClicked: {
+                root.setupBusy = true
+                root.setupError = ""
+                setTargetProc.command = [
+                  "/usr/bin/pkexec",
+                  root.setTargetPath,
+                  "--unit", root.setupService,
+                  "--clear"
+                ]
+                setTargetProc.running = true
+              }
+            }
+          }
+
+          Column {
+            visible: root.setupStep === 3
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: parent.width
+              text: "Run a test backup"
+              iconText: "󰁯"
+              foreground: root.foregroundColor
+              accent: root.successColor
+              bordered: true
+              enabled: !runProc.running
+              onClicked: runProc.running = true
+            }
+
+            Button {
+              width: parent.width
+              text: "Done"
+              iconText: "󰄬"
+              foreground: root.foregroundColor
+              bordered: true
+              onClicked: root.closeSetup()
+            }
+          }
+
+          Text {
+            visible: root.setupError !== ""
+            width: parent.width
+            text: root.setupError
+            color: root.failureColor
+            wrapMode: Text.Wrap
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
           }
         }
       }
