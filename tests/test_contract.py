@@ -12,6 +12,9 @@ class PluginContractTest(unittest.TestCase):
         self.assertTrue((ROOT / "BarWidget.qml").exists())
         self.assertTrue((ROOT / "Panel.qml").exists())
         self.assertTrue((ROOT / "HistoryLifecycle.js").exists())
+        self.assertTrue((ROOT / "assets" / "logo.png").exists())
+        self.assertTrue((ROOT / "scripts" / "run-backup").exists())
+        self.assertTrue((ROOT / "scripts" / "terminate-history-session").exists())
 
     def test_backend_supports_discover_mode(self):
         backend = (ROOT / "scripts" / "backup-history").read_text()
@@ -19,9 +22,6 @@ class PluginContractTest(unittest.TestCase):
         self.assertIn('"--mode"', backend)
         self.assertIn('default="history"', backend)
         self.assertIn('choices=["history", "discover"]', backend)
-        self.assertTrue((ROOT / "assets" / "logo.png").exists())
-        self.assertTrue((ROOT / "scripts" / "run-backup").exists())
-        self.assertTrue((ROOT / "scripts" / "terminate-history-session").exists())
 
     @unittest.skipUnless((ROOT / "manifest.json").exists(), "manifest not implemented")
     def test_manifest_is_publishable_bar_widget(self):
