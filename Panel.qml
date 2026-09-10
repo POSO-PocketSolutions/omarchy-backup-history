@@ -28,7 +28,8 @@ Panel {
   property bool setupBusy: false
   property bool setupServiceFailed: false
   property bool setupApplyPending: false
-  property bool setupAbandoned: false
+  property int setupGeneration: 0
+  property int setupWriteGeneration: -1
   property var discoverCollector: null
   property string discoverRaw: ""
   property bool discoverAborted: false
@@ -90,6 +91,7 @@ Panel {
     var name = target.label !== "" ? target.label : target.path
     return target.freeBytes === null ? name : name + " · " + formattedBytes(target.freeBytes) + " free"
   }
+  readonly property bool setupWriteRunning: setTargetProc.running || setServiceProc.running
   readonly property bool setupRequired: !setupDismissed && !targetConfigured
   readonly property bool showSetup: setupOpen || setupRequired
 
@@ -311,6 +313,9 @@ Panel {
   }
 
   function openSetup() {
+    // A new attempt. Anything still in flight from the previous one carries the
+    // old generation and can no longer touch this session's state.
+    setupGeneration += 1
     setupOpen = true
     setupStep = 0
     setupError = ""
@@ -319,15 +324,16 @@ Panel {
     setupServices = []
     setupServiceFailed = false
     setupApplyPending = false
-    setupAbandoned = false
     setupService = service
     loadDiscovery()
   }
 
   function closeSetup() {
     // Leaving the wizard must never wait on a privileged child. Any pkexec still
-    // in flight is left to finish or be refused; its exit is simply ignored.
-    setupAbandoned = true
+    // in flight is left to finish or be refused; bumping the generation retires
+    // this attempt so the child's exit can no longer drive the UI — but it is
+    // still allowed to refresh, so the panel catches up with what it wrote.
+    setupGeneration += 1
     setupApplyPending = false
     setupOpen = false
     setupDismissed = true
@@ -454,10 +460,15 @@ Panel {
 
   function applyTarget() {
     if (setupService === "" || !setupDisk || setupBusy) return
+    if (setupWriteRunning) {
+      setupError = "A previous change is still being applied"
+      return
+    }
     setupBusy = true
     setupError = ""
     setupServiceFailed = false
     setupApplyPending = true
+    setupWriteGeneration = setupGeneration
     // The privileged write is staged here but started only from
     // setServiceProc.onExited, so the two never race and a failed service
     // selection escalates nothing.
@@ -530,8 +541,13 @@ Panel {
     id: setServiceProc
     command: []
     onExited: function(exitCode, exitStatus) {
-      if (root.historyTearingDown || root.setupAbandoned) return
+      if (root.historyTearingDown) return
       if (!root.setupApplyPending) return
+      if (root.setupWriteGeneration !== root.setupGeneration) {
+        // The attempt that started this was cancelled. Escalate nothing.
+        root.setupApplyPending = false
+        return
+      }
       root.setupApplyPending = false
       if (exitCode !== 0) {
         root.setupServiceFailed = true
@@ -548,7 +564,13 @@ Panel {
     command: []
     stderr: StdioCollector { id: setTargetErrorCollector }
     onExited: function(exitCode, exitStatus) {
-      if (root.historyTearingDown || root.setupAbandoned) return
+      if (root.historyTearingDown) return
+      if (root.setupWriteGeneration !== root.setupGeneration) {
+        // A retired attempt: it may still have written to disk, so let the panel
+        // catch up, but leave this session's step, busy state and error alone.
+        root.refresh()
+        return
+      }
       root.setupBusy = false
       if (exitCode === 0) {
         root.refresh()
@@ -944,28 +966,36 @@ Panel {
 
             Button {
               width: parent.width
-              text: root.setupBusy ? "Applying…" : "Apply"
+              text: root.setupBusy || root.setupWriteRunning ? "Applying…" : "Apply"
               iconText: "󰄬"
               foreground: root.foregroundColor
               accent: root.successColor
               bordered: true
-              enabled: !root.setupBusy && root.setupService !== "" && !!root.setupDisk
+              enabled: !root.setupBusy && !root.setupWriteRunning
+                && root.setupService !== "" && !!root.setupDisk
               onClicked: root.applyTarget()
             }
 
             Button {
               width: parent.width
               visible: root.targetConfigured
-              text: "Forget the current disk"
+              text: root.setupBusy || root.setupWriteRunning
+                ? "Working…"
+                : "Forget the current disk"
               iconText: "󰆴"
               foreground: root.foregroundColor
               bordered: true
-              enabled: !root.setupBusy
+              enabled: !root.setupBusy && !root.setupWriteRunning
               onClicked: {
+                if (root.setupWriteRunning) {
+                  root.setupError = "A previous change is still being applied"
+                  return
+                }
                 root.setupBusy = true
                 root.setupError = ""
                 root.setupServiceFailed = false
                 root.setupApplyPending = false
+                root.setupWriteGeneration = root.setupGeneration
                 setTargetProc.command = [
                   "/usr/bin/pkexec",
                   root.setTargetPath,
