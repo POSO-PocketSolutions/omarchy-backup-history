@@ -53,7 +53,9 @@ class ParseDisksTest(unittest.TestCase):
         uuids = [disk["uuid"] for disk in disks]
         self.assertIn("1f0e5a3c-1111-2222-3333-444455556666", uuids)
         self.assertNotIn(None, uuids)
-        self.assertEqual(len(disks), 2)
+        # The root filesystem (mountpoint "/") is excluded unconditionally as
+        # defense-in-depth, even without root_source.
+        self.assertEqual(len(disks), 1)
 
     def test_reports_expected_fields(self):
         disks = self.backend.parse_disks(LSBLK)
@@ -79,6 +81,23 @@ class ParseDisksTest(unittest.TestCase):
     def test_malformed_json_raises_value_error(self):
         with self.assertRaises(ValueError):
             self.backend.parse_disks("{not json")
+
+    def test_excludes_root_mountpoint_even_without_root_source(self):
+        rooted = json.dumps({"blockdevices": [
+            {
+                "name": "nvme0n1p2", "type": "part", "uuid": "aaaa-bbbb",
+                "label": "root", "size": "930G", "fstype": "ext4",
+                "mountpoint": "/", "rm": False,
+            },
+            {
+                "name": "sda1", "type": "part",
+                "uuid": "1f0e5a3c-1111-2222-3333-444455556666",
+                "label": "backup", "size": "1.8T", "fstype": "ext4",
+                "mountpoint": "/run/media/user/backup", "rm": True,
+            },
+        ]})
+        disks = self.backend.parse_disks(rooted)
+        self.assertEqual([disk["label"] for disk in disks], ["backup"])
 
 
 SYSTEMCTL = json.dumps([

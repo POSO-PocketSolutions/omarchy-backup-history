@@ -360,6 +360,8 @@ def parse_disks(text, root_source=""):
             continue
         if root_source and root_source.endswith("/" + str(node.get("name", ""))):
             continue
+        if node.get("mountpoint") == "/":
+            continue
         disks.append({
             "uuid": uuid,
             "label": node.get("label") or "",
