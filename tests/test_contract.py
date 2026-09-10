@@ -137,6 +137,25 @@ class PluginContractTest(unittest.TestCase):
         self.assertIn("/usr/bin/pkexec", panel)
         self.assertIn("Change backup disk", panel)
 
+    def test_wizard_triggers_when_the_drop_in_is_missing(self):
+        panel = (ROOT / "Panel.qml").read_text()
+
+        self.assertIn("SetupWizard.setupIsRequired(", panel)
+        self.assertIn("target.dropInInstalled", panel)
+        self.assertIn("setupDismissed", panel)
+
+    def test_wizard_offers_a_free_text_service_fallback(self):
+        panel = (ROOT / "Panel.qml").read_text()
+
+        self.assertIn("TextField {", panel)
+        self.assertIn("setupCustomService", panel)
+        self.assertIn("function useCustomService()", panel)
+
+    def test_forget_clears_the_configured_units_drop_in(self):
+        panel = (ROOT / "Panel.qml").read_text()
+
+        self.assertIn('"--unit", root.service,\n                  "--clear"', panel)
+
     def test_wizard_escalates_only_on_apply(self):
         panel = (ROOT / "Panel.qml").read_text()
 
