@@ -101,6 +101,7 @@ class ParseDisksTest(unittest.TestCase):
 
 
 SYSTEMCTL = json.dumps([
+    {"unit": "accounts-daemon.service", "active": "active", "sub": "running"},
     {"unit": "restic-backup.service", "active": "inactive", "sub": "dead"},
     {"unit": "borg-backup.service", "active": "active", "sub": "running"},
     {"unit": "not-a-unit", "active": "active", "sub": "running"},
@@ -116,6 +117,45 @@ class ParseServicesTest(unittest.TestCase):
         units = [service["unit"] for service in self.backend.parse_services(SYSTEMCTL)]
         self.assertIn("restic-backup.service", units)
         self.assertNotIn("not-a-unit", units)
+
+    def test_excludes_units_that_do_not_look_like_backup_jobs(self):
+        units = [service["unit"] for service in self.backend.parse_services(SYSTEMCTL)]
+        self.assertNotIn("accounts-daemon.service", units)
+        self.assertNotIn("user@1000.service", units)
+        self.assertEqual(units, ["restic-backup.service", "borg-backup.service"])
+
+    def test_keeps_units_whose_type_is_oneshot_when_the_listing_reports_it(self):
+        listing = json.dumps([
+            {"unit": "vault-sync.service", "type": "oneshot", "active": "inactive"},
+            {"unit": "vault-daemon.service", "type": "simple", "active": "active"},
+            # A name that matches the heuristic but is not oneshot: the listing's
+            # own Type wins where it is knowable.
+            {"unit": "backup-monitor.service", "type": "simple", "active": "active"},
+        ])
+        units = [service["unit"] for service in self.backend.parse_services(listing)]
+        self.assertEqual(units, ["vault-sync.service"])
+
+    def test_keeps_units_matching_the_configured_units_stem(self):
+        listing = json.dumps([
+            {"unit": "vault-sync.service", "active": "inactive"},
+            {"unit": "vault-sync-prune.service", "active": "inactive"},
+            {"unit": "accounts-daemon.service", "active": "active"},
+        ])
+        units = [
+            service["unit"]
+            for service in self.backend.parse_services(listing, configured="vault-sync.service")
+        ]
+        self.assertEqual(units, ["vault-sync.service", "vault-sync-prune.service"])
+
+    def test_configured_unit_is_kept_even_when_it_does_not_match_the_heuristic(self):
+        listing = json.dumps([
+            {"unit": "accounts-daemon.service", "active": "active", "sub": "running"},
+            {"unit": "zzz.service", "active": "active", "sub": "running"},
+        ])
+        services = self.backend.parse_services(listing, configured="zzz.service")
+        self.assertEqual([service["unit"] for service in services], ["zzz.service"])
+        self.assertEqual(services[0]["state"], "active")
+        self.assertTrue(services[0]["exists"])
 
     def test_reports_active_state(self):
         services = self.backend.parse_services(SYSTEMCTL)
@@ -136,7 +176,7 @@ class ParseServicesTest(unittest.TestCase):
 
     def test_caps_the_service_count(self):
         many = json.dumps([
-            {"unit": f"unit-{index}.service", "active": "inactive", "sub": "dead"}
+            {"unit": f"backup-{index}.service", "active": "inactive", "sub": "dead"}
             for index in range(200)
         ])
         self.assertEqual(len(self.backend.parse_services(many)), self.backend.MAX_SERVICES)

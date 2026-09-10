@@ -49,6 +49,15 @@ MAX_DISKS = 32
 LSBLK_TIMEOUT_SECONDS = 3.0
 LSBLK_MAX_BYTES = 256 * 1024
 MAX_SERVICES = 64
+SERVICE_NAME_HINTS = (
+    "backup",
+    "restic",
+    "borg",
+    "rsync",
+    "snapshot",
+    "duplicity",
+    "timeshift",
+)
 
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -401,16 +410,42 @@ def discover_disks():
     return parse_disks(output, _root_source())
 
 
+def service_stem(unit):
+    """The unit name without its `.service` suffix, lowercased."""
+    return unit[: -len(".service")].lower() if unit.endswith(".service") else unit.lower()
+
+
+def is_backup_candidate(entry, unit, configured_stem=""):
+    """Keep plausible backup units only.
+
+    `systemctl list-units` does not report `Type=`, so a listing that does carry
+    it is trusted (oneshot only) and anything else falls back to a name
+    heuristic. The configured unit is pinned separately by parse_services and
+    never has to pass this filter.
+    """
+    unit_type = str(entry.get("type") or "").strip().lower()
+    if unit_type:
+        return unit_type == "oneshot"
+    name = unit.lower()
+    if configured_stem and configured_stem in name:
+        return True
+    return any(hint in name for hint in SERVICE_NAME_HINTS)
+
+
 def parse_services(text, configured=""):
     document = json.loads(text)
     services = []
     seen = set()
+    configured_stem = ""
     if configured and SERVICE_PATTERN.fullmatch(configured):
         services.append({"unit": configured, "state": "unknown", "exists": False})
         seen.add(configured)
+        configured_stem = service_stem(configured)
     for entry in document:
         unit = str(entry.get("unit", ""))
         if unit in seen or not SERVICE_PATTERN.fullmatch(unit):
+            continue
+        if not is_backup_candidate(entry, unit, configured_stem):
             continue
         seen.add(unit)
         services.append({
